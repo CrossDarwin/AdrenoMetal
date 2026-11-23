@@ -21,11 +21,12 @@ use metal2vulkan_runtime::{
     BlitCommandEncoder, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, DepthStencilState, Device, Event, Fence, LoadAction,
     Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
-    SamplerState, ScissorRect, SharedEvent, StoreAction, Viewport, VisibilityResultMode,
+    Resource as RuntimeResource, ResourceUsage, SamplerState, ScissorRect, SharedEvent,
+    StoreAction, Viewport, VisibilityResultMode,
 };
 use crate::purge::{Cause, Purge, Resource};
 use crate::library::{Function, Library};
-use crate::resources::{Buffer, PurgeableState, ResourceOptions};
+use crate::resources::{Buffer, PurgeableState, ResourceOptions, StorageMode};
 use crate::archive::BinaryArchive;
 use crate::texture::{Texture, TextureDescriptor};
 use crate::heap::{Heap, HeapDescriptor, HeapType};
@@ -1164,7 +1165,7 @@ pub extern "C" fn nmb_heap_new_buffer(heap: *const NmbHeap, length: u64, options
 pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const NmbTextureDescriptor, offset: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let (tie, heap) = (get(heap)?.0.tie(), get(heap)?.0.live()?);
-        let descriptor = texture_descriptor(descriptor)?;
+        let descriptor = owned_texture_descriptor(descriptor)?;
         let texture = if offset == u64::MAX { heap.new_texture(&descriptor) } else { heap.new_texture_at_offset(&descriptor, offset) };
         Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("heap texture"))?, tie))))
     })
@@ -1175,7 +1176,7 @@ pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
     guard(false, || {
-        let answer = get(device)?.0.heap_texture_size_and_align(&texture_descriptor(descriptor)?.runtime()?).map_err(e("heap texture size"))?;
+        let answer = get(device)?.0.heap_texture_size_and_align(&owned_texture_descriptor(descriptor)?.runtime()?).map_err(e("heap texture size"))?;
         let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
         (out[0], out[1]) = (answer.size, answer.align);
         Ok(true)
@@ -1246,6 +1247,19 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     Ok(out)
 }
 
+fn owned_texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
+    let mut descriptor = texture_descriptor(d)?;
+    // Runtime v2 refuses memoryless images. Use ordinary private backing for
+    // attachment-only allocations, including single-sample RenderBox targets.
+    if descriptor.resource_options.storage_mode() == StorageMode::Memoryless
+        && descriptor.usage == TextureUsage::RENDER_TARGET
+    {
+        let raw = descriptor.resource_options.raw();
+        descriptor.resource_options = options((raw & !0xf0) | ResourceOptions::private().raw())?;
+    }
+    Ok(descriptor)
+}
+
 #[cfg(test)]
 mod texture_descriptor_tests {
     use super::*;
@@ -1265,12 +1279,34 @@ mod texture_descriptor_tests {
         descriptor.allow_gpu_optimized_contents = 1;
         assert!(texture_descriptor(&descriptor).unwrap().allow_gpu_optimized_contents);
     }
+
+    #[test]
+    fn memoryless_renderbox_targets_use_private_backing() {
+        let mut descriptor = NmbTextureDescriptor {
+            kind: TextureType::Type2D.as_raw() as u64,
+            format: PixelFormat::RG16Float.as_raw() as u64,
+            width: 575, height: 214, depth: 1, levels: 1, samples: 1, array_length: 1,
+            usage: TextureUsage::RENDER_TARGET.as_raw() as u64,
+            options: 0x131,
+            rotation: 0, framebuffer_only: 0, is_drawable: 0, swizzle: 0,
+            allow_gpu_optimized_contents: 1,
+        };
+        let allocated = owned_texture_descriptor(&descriptor).unwrap();
+        assert_eq!(allocated.resource_options.raw(), 0x121);
+        let runtime = allocated.runtime().unwrap();
+        assert_eq!(runtime.storage_mode, metal2vulkan_runtime::StorageMode::Private);
+        assert_eq!(runtime.pixel_format, PixelFormat::RG16Float);
+        assert_eq!(runtime.usage, TextureUsage::RENDER_TARGET);
+        assert_eq!(texture_descriptor(&descriptor).unwrap().resource_options.raw(), 0x131);
+        descriptor.usage |= TextureUsage::SHADER_READ.as_raw() as u64;
+        assert_eq!(owned_texture_descriptor(&descriptor).unwrap().resource_options.raw(), 0x131);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const NmbTextureDescriptor) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
-        let descriptor = texture_descriptor(descriptor)?;
+        let descriptor = owned_texture_descriptor(descriptor)?;
         let device = get(device)?;
         let texture = Texture::allocate(&device.0, &descriptor)?;
         // A drawable's texture is the display's: never discarded.
@@ -2534,6 +2570,26 @@ pub extern "C" fn nmb_command_buffer_on_scheduled(command_buffer: *mut NmbComman
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_schedule_native_scanout(command_buffer: *const NmbCommandBuffer) -> bool {
+    guard(false, || {
+        get(command_buffer)?.0.schedule_native_scanout().map_err(e("native scanout scheduling"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_native_submission(command_buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || Ok(get(command_buffer)?.0.native_submission()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_install_native_submit_cursor(cursor: Option<extern "C" fn() -> u64>) {
+    if let Some(cursor) = cursor {
+        CommandBuffer::install_native_submit_cursor(cursor);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbCommandBuffer) -> bool {
     guard(false, || {
         get(command_buffer)?.0.wait_until_scheduled().map_err(e("wait scheduled"))?;
@@ -2933,6 +2989,42 @@ fn blit<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut BlitCommandEncoder, Stri
 
 fn optional<'a, T>(handle: *const T) -> Result<Option<&'a T>, String> {
     if handle.is_null() { Ok(None) } else { get(handle).map(Some) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_use_resource(
+    encoder: *mut NmbEncoder,
+    buffer: *const NmbBuffer,
+    texture: *const NmbTexture,
+    usage: u64,
+) -> bool {
+    guard(false, || {
+        let encoder = get_mut(encoder)?;
+        let bits = raw::<metal2vulkan::metal::ResourceUsage>(usage, "resource usage")?.as_raw();
+        let Some(usage) = [
+            (1, ResourceUsage::READ),
+            (2, ResourceUsage::WRITE),
+            (4, ResourceUsage::SAMPLE),
+        ]
+        .into_iter()
+        .filter_map(|(bit, usage)| (bits & bit != 0).then_some(usage))
+        .reduce(|a, b| a | b) else {
+            return Ok(true);
+        };
+        let buffer = optional(buffer)?.map(|buffer| buffer.0.live()).transpose()?;
+        let texture = optional(texture)?.map(|texture| texture.0.live()).transpose()?;
+        let resource = match (buffer.as_deref(), texture.as_deref()) {
+            (Some(buffer), None) => RuntimeResource::Buffer(buffer),
+            (None, Some(texture)) => RuntimeResource::Texture(texture),
+            _ => return Err("expected one indirect resource".into()),
+        };
+        match encoder {
+            NmbEncoder::Compute(encoder) => encoder.use_resource(resource, usage),
+            NmbEncoder::Render(encoder) => encoder.use_resource(resource, usage),
+            NmbEncoder::Blit(_) => return Err("resource declarations require a compute or render encoder".into()),
+        }.map_err(e("use resource"))?;
+        Ok(true)
+    })
 }
 
 const COMPUTE: u32 = 0;
@@ -3498,6 +3590,18 @@ pub extern "C" fn nmb_device_runtime_metrics(device: *const NmbDevice, out: *mut
             m.first_use_waits, m.first_use_wait_nanos, m.held_releases, m.held_release_bytes];
         // SAFETY: the ABI names 32 writable words.
         unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len()); }
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_host_texture_copies(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() { return Err("null host texture counters output".into()); }
+        let metrics = get(device)?.0.counters().metrics();
+        // SAFETY: the caller supplies two writable words.
+        unsafe { std::slice::from_raw_parts_mut(out, 2) }
+            .copy_from_slice(&[metrics.over_copies_host_memory, metrics.over_copy_bytes_host_memory]);
         Ok(true)
     })
 }

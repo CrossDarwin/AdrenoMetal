@@ -396,6 +396,7 @@ struct NmbRenderPassDescriptor {
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
 bool nmb_encoder_end(NmbEncoder *);
 void nmb_encoder_discard(NmbEncoder *);
+bool nmb_encoder_use_resource(NmbEncoder *, const NmbBuffer *, const NmbTexture *, uint64_t usage);
 
 /* stage: 0 compute, 1 vertex, 2 fragment */
 bool nmb_encoder_set_buffer(NmbEncoder *, uint32_t stage, NmbBuffer *, uint64_t offset, uint32_t index);
@@ -466,6 +467,9 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
                                 uint64_t bytes_per_image);
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
 uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
+bool nmb_command_buffer_schedule_native_scanout(const NmbCommandBuffer *);
+uint64_t nmb_command_buffer_native_submission(const NmbCommandBuffer *);
+void nmb_install_native_submit_cursor(uint64_t (*cursor)(void));
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
 /* Runtime-v2 DEBUG metrics, 32 words: version; submissions, submit infos, submit ns/max ns,
    queue-lock ns; passes, barriers, copied/zeroed bytes; pipelines, pipeline ns;
@@ -475,6 +479,8 @@ void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
    shared take, private take; first-use waits/ns; held releases/bytes.
    Version-1 statistics queries return false under runtime v2; their layouts are not equivalent. */
 bool nmb_device_runtime_metrics(const NmbDevice *, uint64_t *out);
+/* Two cumulative counters for copies between imported host buffers and their texture images. */
+bool nmb_device_host_texture_copies(const NmbDevice *, uint64_t out[2]);
 
 #ifdef __cplusplus
 }

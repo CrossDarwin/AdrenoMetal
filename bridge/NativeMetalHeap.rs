@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Consumer heap placements over runtime blocks, with leases held through GPU retirement.
 use crate::resources::{Buffer, PurgeableState, ResourceOptions, StorageMode};
-use crate::texture::{Texture, TextureDescriptor};
+use crate::texture::{reserve_texture_index, Texture, TextureDescriptor};
 use metal2vulkan_runtime as rt;
 use std::collections::BTreeMap;
 use std::sync::{
@@ -291,15 +291,11 @@ impl Heap {
             .heap_texture_size_and_align(&d)
             .map_err(|e| format!("heap texture size: {e:?}"))?;
         let (lease, offset) = self.place(requirement, offset)?;
-        let index = self
-            .0
-            .device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = reserve_texture_index(&self.0.device, d.pixel_format, d.usage)?;
         let raw = self
             .0
             .device
-            .new_heap_texture(&d, Some(index.index()), self.range(), offset)
+            .new_heap_texture(&d, index.as_ref().map(rt::IndexReservation::index), self.range(), offset)
             .map_err(|e| format!("heap texture: {e:?}"))?;
         raw.retain_until_unused(lease.clone());
         Ok(Texture::placed(

@@ -1,0 +1,40 @@
+diff --git a/crates/metal2vulkan-runtime/src/import.rs b/crates/metal2vulkan-runtime/src/import.rs
+index 4f43da91..bc2652b4 100644
+--- a/crates/metal2vulkan-runtime/src/import.rs
++++ b/crates/metal2vulkan-runtime/src/import.rs
+@@ -803,6 +803,35 @@ impl Device {
+         pointer: NonNull<u8>,
+         len: u64,
+         release: Option<Box<dyn FnOnce() + Send>>,
++    ) -> Result<(Block, u32), Error> {
++        // SAFETY: the caller satisfies the host import's mapping and lifetime requirements.
++        unsafe { self.import_host_mapping(pointer, len, release) }
++    }
++
++    /// Import pages for GPU reads through the bundled native Darwin driver.
++    ///
++    /// # Safety
++    ///
++    /// The buffer must remain mapped read-only until release. The device must
++    /// use the Darwin Turnip backend whose kernel driver pins such memory for
++    /// reading and strips GPU write permission. Place only initialized bytes
++    /// over the returned block and use them exclusively as read sources.
++    #[cfg(target_os = "ios")]
++    pub unsafe fn import_darwin_read_only_host_memory(
++        &self,
++        pointer: NonNull<u8>,
++        len: u64,
++        release: Option<Box<dyn FnOnce() + Send>>,
++    ) -> Result<(Block, u32), Error> {
++        // SAFETY: the native backend and read-only placement are the caller's contract.
++        unsafe { self.import_host_mapping(pointer, len, release) }
++    }
++
++    unsafe fn import_host_mapping(
++        &self,
++        pointer: NonNull<u8>,
++        len: u64,
++        release: Option<Box<dyn FnOnce() + Send>>,
+     ) -> Result<(Block, u32), Error> {
+         let core = self.core();
+         let handle = ImportHandle::HostMemory;

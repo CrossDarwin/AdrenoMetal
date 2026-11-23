@@ -126,22 +126,37 @@ static bool bootArgSet(const char *key) {
     const size_t length = strlen(key);
     return at && (at[length] == 0 || at[length] == ' ');
 }
-// `site` is the slid address of that branch in the running QuartzCore; any other word there is left alone (0x6E41).
-[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t site) {
+[[maybe_unused]] static unsigned patchQuartzCoreInstruction(uintptr_t site, uint32_t original, uint32_t replacement,
+                                                             unsigned status) {
     uint32_t word = 0;
-    if (!readTask(site, &word, sizeof word)) return 0x6E40;
-    if (word == 0xd503201f) return 0x6E42;
-    if (word != 0x37000608) return 0x6E41;
+    if (!readTask(site, &word, sizeof word)) return status;
+    if (word == replacement) return status + 2;
+    if (word != original) return status + 1;
     const vm_address_t page = site & ~(uintptr_t)(vm_page_size - 1);
-    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0x6E51;
-    const uint32_t nop = 0xd503201f;
-    const bool wrote = vm_write(mach_task_self(), site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
+    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+        return status + 0x11;
+    const bool wrote = writeTask(site, &replacement, sizeof replacement);
+    if (wrote) sys_icache_invalidate(reinterpret_cast<void *>(site), sizeof replacement);
     const bool restored = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS;
-    sys_icache_invalidate((void *)site, sizeof nop);
-    if (!wrote) return 0x6E52;
-    if (!restored) return 0x6E53;
-    return 0x6E42;
+    if (!restored) return status + 0x13;
+    if (!wrote) return status + 0x12;
+    return status + 2;
 }
+#if !TARGET_OS_OSX && defined(__arm64e__)
+static unsigned patchIOSurfaceRowAlignment(uintptr_t slide) {
+    // 24A446 MetalContext::is_viable_texture_from_iosurface loads the AGX
+    // row minimum here. Turnip's linear rows use 64-byte alignment, and
+    // the host-memory texture path checks texel pitch and backing range.
+    constexpr uintptr_t start = 0x1844623b8;
+    constexpr uint32_t original = 0xf945fd19; // ldr x25, [x8, #0xbf8]
+    constexpr uint32_t replacement = 0xd2800819; // mov x25, #64
+    uint32_t words[5] = {};
+    if (!readTask(start + slide, words, sizeof words)) return 0x6E60;
+    if (words[0] != 0xb0315dc8 || words[2] != 0xd1000728 ||
+        words[3] != 0xea14011f || words[4] != 0x540003a0) return 0x6E61;
+    return patchQuartzCoreInstruction(start + sizeof(uint32_t) + slide, original, replacement, 0x6E60);
+}
+#endif
 // Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
@@ -375,6 +390,9 @@ static id deviceForPort(unsigned port) {
         }
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
+        if (!strcmp(getprogname(), "backboardd") && bootArgSet("panel-sync=2"))
+            setenv("NATIVE_METAL_PANEL_SYNC", "1", 1);
+        else unsetenv("NATIVE_METAL_PANEL_SYNC");
         // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
         // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
         // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
@@ -526,7 +544,17 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
+            if (!strcmp(getprogname(), "backboardd") &&
+                (bootArgSet("fb-bgra=1") || bootArgSet("sheng-fb-bgra=1"))) {
+                const unsigned status = patchQuartzCoreInstruction(0x184461928 + slide, 0x37000608, 0xd503201f, 0x6E40);
+                gpu->mark(status);
+                os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal framebuffer BGRA patch: status=0x%{public}x", status);
+                if (status == 0x6E42 && bootArgSet("panel-sync=2")) {
+                    const unsigned rowStatus = patchIOSurfaceRowAlignment(slide);
+                    gpu->mark(rowStatus);
+                    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal IOSurface row alignment patch: status=0x%{public}x", rowStatus);
+                }
+            }
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).

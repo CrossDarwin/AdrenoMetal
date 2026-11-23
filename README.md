@@ -89,10 +89,12 @@ sampling stays off in the ordinary release configuration.
 
 ## Current upstream limits
 
-Runtime v2 explicitly refuses memoryless textures, YCbCr and extended-range
-texture conversions, tile pipelines and tile dispatch. The frontend does not
-advertise those capabilities. Ordinary color IOSurface planes use the runtime's
-buffer-texture path. Nonzero texture rotations, padded 3D buffer-texture image
+Runtime v2 explicitly refuses native memoryless textures, YCbCr and extended-range
+texture conversions, tile pipelines and tile dispatch. The frontend supplies private
+backing for owned attachment-only memoryless requests. Ordinary color IOSurface
+planes use the runtime's buffer-texture path. The host buffer shares the surface's
+pages and the runtime synchronizes the texture image with that buffer using copies.
+Nonzero texture rotations, padded 3D buffer-texture image
 pitches, indexed control-point patch draws and tessellation factor scaling also
 report explicit errors.
 

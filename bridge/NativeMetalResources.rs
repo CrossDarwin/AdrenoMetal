@@ -266,16 +266,19 @@ impl Buffer {
         ) {
             return Err("no-copy buffers require Shared or Managed storage".into());
         }
-        if options.raw() & (1 << 24) != 0 {
-            return Err("read-only no-copy memory requires a protected import; runtime v2 has no read-only import".into());
-        }
         // Arm the caller callback only after all fallible placement operations succeed.
         // Failed construction leaves ownership with the C caller.
         let pending = Arc::new(Mutex::new(None::<Box<dyn FnOnce() + Send>>));
         let freed = pending.clone();
         // The GPU imports an alias, not the reusable virtual address the client gave.
         // This mapping is released after Vulkan frees the imported memory.
-        let mapping = unsafe { crate::host_mapping::HostMapping::alias(pointer, length) }?;
+        let mapping = unsafe {
+            crate::host_mapping::HostMapping::alias(pointer, length, cfg!(target_os = "ios"))
+        }?;
+        let read_only = mapping.read_only();
+        if options.raw() & (1 << 24) != 0 && !read_only {
+            return Err("read-only no-copy memory requires read-only VM protection".into());
+        }
         let imported = mapping.pointer();
         let callback = Box::new(move || {
             let callback = freed.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -284,9 +287,19 @@ impl Buffer {
                 callback();
             }
         });
-        // SAFETY: the ABI caller owns the mapping until the runtime releases its import.
-        let (block, _) = unsafe { device.import_host_memory(imported, length, Some(callback)) }
-            .map_err(|e| format!("host-page import: {e:?}"))?;
+        // SAFETY: the callback owns the stable alias. The iOS bundle uses the
+        // native Darwin Turnip backend, whose kernel also enforces read-only GPU access.
+        #[cfg(target_os = "ios")]
+        let imported_block = unsafe {
+            if read_only {
+                device.import_darwin_read_only_host_memory(imported, length, Some(callback))
+            } else {
+                device.import_host_memory(imported, length, Some(callback))
+            }
+        };
+        #[cfg(not(target_os = "ios"))]
+        let imported_block = unsafe { device.import_host_memory(imported, length, Some(callback)) };
+        let (block, _) = imported_block.map_err(|e| format!("host-page import: {e:?}"))?;
         let mut blocks = vec![block];
         let raw = if options.storage_mode() == StorageMode::Managed {
             let copy = if device.has_unified_memory() {

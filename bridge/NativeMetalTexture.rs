@@ -10,6 +10,40 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+fn needs_texture_index(format: PixelFormat, usage: TextureUsage) -> bool {
+    // Runtime v2 allocates resource IDs for shader access and color attachment reads.
+    usage.is_empty()
+        || usage.intersects(TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE)
+        || (usage.contains(TextureUsage::RENDER_TARGET)
+            && !metal2vulkan::metal::format::is_depth_stencil(format))
+}
+
+pub(crate) fn reserve_texture_index(
+    device: &rt::Device,
+    format: PixelFormat,
+    usage: TextureUsage,
+) -> Result<Option<rt::IndexReservation>, String> {
+    if !needs_texture_index(format, usage) {
+        return Ok(None);
+    }
+    device
+        .reserve_index(rt::IndexClass::Texture)
+        .map(Some)
+        .ok_or_else(|| "texture index space exhausted".into())
+}
+
+#[cfg(test)]
+#[test]
+fn attachment_indices_follow_runtime_shader_access() {
+    let depth = PixelFormat::Depth32FloatStencil8;
+    let target = TextureUsage::RENDER_TARGET;
+    assert!(!needs_texture_index(depth, target));
+    assert!(!needs_texture_index(depth, target | TextureUsage::PIXEL_FORMAT_VIEW));
+    assert!(needs_texture_index(depth, target | TextureUsage::SHADER_READ));
+    assert!(needs_texture_index(depth, TextureUsage::empty()));
+    assert!(needs_texture_index(PixelFormat::RG16Float, target));
+}
+
 #[derive(Clone, Debug)]
 pub struct TextureDescriptor {
     pub texture_type: TextureType,
@@ -139,11 +173,9 @@ impl Texture {
             .is_some_and(|lease| lease.is_aliasable())
     }
     pub fn allocate(device: &rt::Device, descriptor: &TextureDescriptor) -> Result<Self, String> {
-        let index = device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = reserve_texture_index(device, descriptor.pixel_format, descriptor.usage)?;
         let raw = device
-            .new_texture(&descriptor.runtime()?, Some(index.index()))
+            .new_texture(&descriptor.runtime()?, index.as_ref().map(rt::IndexReservation::index))
             .map_err(|e| format!("texture: {e:?}"))?;
         Ok(Self {
             raw,
@@ -160,13 +192,11 @@ impl Texture {
         bytes_per_row: u64,
     ) -> Result<Self, String> {
         let device = buffer.device();
-        let index = device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = reserve_texture_index(device, descriptor.pixel_format, descriptor.usage)?;
         let raw = (**buffer)
             .new_texture(
                 &descriptor.runtime()?,
-                Some(index.index()),
+                index.as_ref().map(rt::IndexReservation::index),
                 offset,
                 bytes_per_row,
             )
@@ -213,10 +243,7 @@ impl Texture {
         swizzle: TextureSwizzleChannels,
     ) -> Result<Self, String> {
         let narrow = |v| u32::try_from(v).map_err(|_| "texture view range exceeds u32".to_owned());
-        let index = self
-            .device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = reserve_texture_index(&self.device, format, self.raw.descriptor().usage)?;
         let raw = self
             .raw
             .new_texture_view_with_swizzle(
@@ -225,7 +252,7 @@ impl Texture {
                 narrow(levels.start)?..narrow(levels.end)?,
                 narrow(slices.start)?..narrow(slices.end)?,
                 swizzle,
-                Some(index.index()),
+                index.as_ref().map(rt::IndexReservation::index),
             )
             .map_err(|e| format!("texture view: {e:?}"))?;
         let runtime = raw.descriptor();

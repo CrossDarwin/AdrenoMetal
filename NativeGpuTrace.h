@@ -15,6 +15,7 @@ enum {
     GpuTraceDisplayLatch=23, GpuTraceTurnipPass=36, GpuTraceTurnipGmemSide=37, GpuTraceTurnipAttachment=44,
     GpuTraceThread=63, GpuTraceProblem=65
 };
+enum {GpuTraceScanoutHandoff=71};
 struct NativeGpuTraceRecord {
     uint64_t sequence,us;
     uint32_t event,pid;

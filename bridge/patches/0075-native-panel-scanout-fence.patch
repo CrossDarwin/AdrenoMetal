@@ -1,0 +1,181 @@
+diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-runtime/src/command.rs
+index 21d5cf41..708da414 100644
+--- a/crates/metal2vulkan-runtime/src/command.rs
++++ b/crates/metal2vulkan-runtime/src/command.rs
+@@ -191,6 +191,7 @@ pub(crate) struct CbInner {
+ struct CbState {
+     status: CommandBufferStatus,
+     error: Option<CommandBufferError>,
++    native_submission: u64,
+     /// The handlers have run: waits for completion return.
+     finished: bool,
+     /// Scheduled, and its scheduled handlers have returned (or it has none): waits for
+@@ -293,6 +294,7 @@ impl Pushed {
+ pub(crate) struct Gpu {
+     pub(crate) recorder: Option<Recorder>,
+     pub(crate) segments: Vec<Segment>,
++    pub(crate) native_scanout: bool,
+     /// Each heap's block the commands use (`useHeap:`), once: a block released meanwhile is
+     /// reused only after the command buffer retires.
+     pub(crate) blocks: Vec<Arc<Block>>,
+@@ -339,6 +341,10 @@ impl Gpu {
+     pub(crate) fn presents(&self) -> bool {
+         (self.segments.last()).is_some_and(|segment| !segment.binary.is_empty())
+     }
++
++    pub(crate) fn schedules_after_submit(&self) -> bool {
++        self.native_scanout || self.presents()
++    }
+ }
+ 
+ /// One submission's part of a command buffer: its waits, its commands and its signals.
+@@ -419,6 +425,7 @@ impl CommandBuffer {
+                 state: Mutex::new(CbState {
+                     status: CommandBufferStatus::NotEnqueued,
+                     error: None,
++                    native_submission: 0,
+                     finished: false,
+                     scheduled_ran: false,
+                     building: Some(Building {
+@@ -426,6 +433,7 @@ impl CommandBuffer {
+                         gpu: Gpu {
+                             recorder: None,
+                             segments: vec![Segment::default()],
++                            native_scanout: false,
+                             blocks: Vec::new(),
+                             kept,
+                             ring: Writes::default(),
+@@ -466,6 +474,25 @@ impl CommandBuffer {
+         lock(&self.inner.state)
+     }
+ 
++    /// Make a native scanout writer observable as scheduled only after its
++    /// final submission, as for a command buffer presenting a Vulkan drawable.
++    pub fn schedule_native_scanout(&self) -> Result<(), Error> {
++        self.building(|building| {
++            building.gpu.native_scanout = true;
++            Ok(())
++        })
++    }
++
++    /// The observed native submission cursor, or zero if unavailable.
++    pub fn native_submission(&self) -> u64 {
++        self.state().native_submission
++    }
++
++    /// Install the driver's thread-local submission cursor for this process.
++    pub fn install_native_submit_cursor(cursor: extern "C" fn() -> u64) {
++        crate::submit::install_native_submit_cursor(cursor);
++    }
++
+     /// Runs `f` on what is being recorded. Err: [`Refusal::Committed`];
+     /// [`Refusal::EncoderOpen`].
+     fn building<R>(&self, f: impl FnOnce(&mut Building) -> Result<R, Error>) -> Result<R, Error> {
+@@ -1600,6 +1627,10 @@ impl Building {
+ }
+ 
+ impl CbInner {
++    pub(crate) fn note_native_submission(&self, cursor: u64) {
++        lock(&self.state).native_submission = cursor;
++    }
++
+     /// The last segment joined a submission at `now`: passed to `vkQueueSubmit2` at once, or held
+     /// in its queue's group. With `handlers`, its scheduled handlers are still to run
+     /// ([`run_scheduled`]), and a wait for its scheduling waits for them.
+@@ -1731,6 +1762,7 @@ pub(crate) fn retire(
+         fences,
+         executed,
+         queries,
++        native_scanout: _,
+     } = gpu;
+     if let Some(recorder) = recorder {
+         core.recorders.give_back(core, recorder);
+diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-runtime/src/submit.rs
+index 1d16c8a5..e6d9b409 100644
+--- a/crates/metal2vulkan-runtime/src/submit.rs
++++ b/crates/metal2vulkan-runtime/src/submit.rs
+@@ -1635,7 +1635,7 @@ impl WorkState {
+             return;
+         };
+         let empty = pending.gpu.is_empty() && !captured.waits_for(pending.seq);
+-        if entry.error.is_some() || empty || pending.gpu.presents() {
++        if entry.error.is_some() || empty || pending.gpu.schedules_after_submit() {
+             fifo.send_through = fifo.send_through.max(entry.place);
+             return;
+         }
+@@ -1865,7 +1865,9 @@ impl WorkState {
+         else {
+             return Step::Staged;
+         };
+-        if held.is_none() && !pending.gpu.presents() {
++        let schedules_after_submit = pending.gpu.schedules_after_submit();
++        let native_scanout = pending.gpu.native_scanout;
++        if held.is_none() && !schedules_after_submit {
+             let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+             cb.scheduled(now, !scheduled.is_empty());
+             if !scheduled.is_empty() {
+@@ -1878,7 +1880,7 @@ impl WorkState {
+         // A command buffer held for room behind it joins it or, not taken, sends it first: with
+         // room the two would have been staged together.
+         let held_behind = (fifo.entries.front()).is_some_and(|entry| entry.held.is_some());
+-        match signals || (fifo.goes(stop) && !held_behind) {
++        match signals || native_scanout || (fifo.goes(stop) && !held_behind) {
+             true => Step::Goes(index),
+             false => Step::Staged,
+         }
+@@ -2476,11 +2478,16 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
+             ..Staged::default()
+         }]),
+     }
++    let mut native_submission = 0;
+     if ok.is_ok() {
+         let asked = times::host_time();
+         #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+         (core.work.asking).store(true, Ordering::SeqCst);
+         let queue = lock(&core.queues.runtime);
++        let cursor = NATIVE_SUBMIT_CURSOR.get().filter(|_| {
++            finished.iter().any(|(_, pending, error)| error.is_none() && pending.gpu.native_scanout)
++        });
++        let before = cursor.map_or(0, |read| read());
+         (core.counters).queue_lock_wait(times::host_time().saturating_sub(asked));
+         // A bind of an import over several dma-bufs since the last submission: this one waits for
+         // it, and every later command, in this submission and after it, is ordered after that
+@@ -2542,6 +2549,12 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
+                 break;
+             }
+         }
++        if let Some(read) = cursor {
++            let after = read();
++            if after >> 32 != 0 && after >> 32 != before >> 32 {
++                native_submission = after;
++            }
++        }
+         drop(queue);
+     }
+     match ok {
+@@ -2554,7 +2567,10 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
+             // retires.
+             let now = times::host_time();
+             for (cb, pending, error) in &mut finished {
+-                if error.is_none() && pending.gpu.presents() {
++                if error.is_none() && pending.gpu.schedules_after_submit() {
++                    if pending.gpu.native_scanout {
++                        cb.note_native_submission(native_submission);
++                    }
+                     let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+                     cb.scheduled(now, !scheduled.is_empty());
+                     if !scheduled.is_empty() {
+@@ -2587,6 +2603,13 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
+     }
+ }
+ 
++static NATIVE_SUBMIT_CURSOR: std::sync::OnceLock<extern "C" fn() -> u64> =
++    std::sync::OnceLock::new();
++
++pub(crate) fn install_native_submit_cursor(cursor: extern "C" fn() -> u64) {
++    let _ = NATIVE_SUBMIT_CURSOR.set(cursor);
++}
++
+ impl Upload {
+     /// Recycles the upload's recorder and gives up what it holds, and its pair of timestamp
+     /// queries, read where its submission completed (`end`, [`times::retire_own`]): once its

@@ -1,0 +1,100 @@
+diff --git a/crates/metal2vulkan-runtime/src/sampler.rs b/crates/metal2vulkan-runtime/src/sampler.rs
+index c219304d..d3931023 100644
+--- a/crates/metal2vulkan-runtime/src/sampler.rs
++++ b/crates/metal2vulkan-runtime/src/sampler.rs
+@@ -18,7 +18,7 @@ use ash::vk;
+ use metal2vulkan::bind::SamplerDescriptor;
+ use metal2vulkan::device::DeviceProfile;
+ use metal2vulkan::metal::sampler::{lod_clamps_read_alike, vk_sampler, SamplerUse, SamplerWord};
+-use metal2vulkan::metal::{CompareFunction, SamplerMinMagFilter};
++use metal2vulkan::metal::{CompareFunction, SamplerAddressMode as MetalAddressMode, SamplerMinMagFilter, SamplerMipFilter};
+ use metal2vulkan::pipeline::{CombinedSampler, PrecisionNote};
+ use metal2vulkan::vk::{BorderColor, SamplerAddressMode, SamplerDesc};
+ use std::collections::HashMap;
+@@ -346,6 +346,9 @@ impl Device {
+     /// buffer not yet retired, is taken at once, as a texture's is
+     /// ([`Device::new_texture`](crate::Device::new_texture)): the earlier one's going leaves it.
+     ///
++    /// On iOS, RenderBox's normalized, non-mipmapped cubic clamp sampler uses
++    /// linear filtering until dynamic cubic filtering is implemented.
++    ///
+     /// Err: [`Refusal::IndicesNotGranted`](crate::Refusal::IndicesNotGranted);
+     /// [`Gap::CubicSampler`];
+     /// [`Error::Translation`] where the translator makes no device sampler of the descriptor;
+@@ -356,13 +359,11 @@ impl Device {
+         descriptor: &SamplerDescriptor,
+         index: u32,
+     ) -> Result<SamplerState, Error> {
+-        if [descriptor.min_filter, descriptor.mag_filter].contains(&SamplerMinMagFilter::Cubic) {
+-            return Err(Error::Unsupported(Gap::CubicSampler));
+-        }
++        let effective = device_sampler_descriptor(descriptor, cfg!(target_os = "ios"))?;
+         let core = self.core();
+         let profile = core.translator.profile();
+         let desc = |compare, integer| {
+-            vk_sampler(descriptor, SamplerUse::new(compare, integer), profile)
++            vk_sampler(&effective, SamplerUse::new(compare, integer), profile)
+                 .map(canonical)
+                 .map_err(Error::translation)
+         };
+@@ -409,7 +410,7 @@ impl Device {
+                 descriptor: *descriptor,
+                 index,
+                 owner,
+-                word: SamplerWord::of(descriptor).0,
++                word: SamplerWord::of(&effective).0,
+                 uses,
+             }),
+             _device: self.clone(),
+@@ -417,6 +418,51 @@ impl Device {
+     }
+ }
+ 
++fn device_sampler_descriptor(
++    descriptor: &SamplerDescriptor,
++    renderbox_compatibility: bool,
++) -> Result<SamplerDescriptor, Error> {
++    let cubic = SamplerMinMagFilter::Cubic;
++    if ![descriptor.min_filter, descriptor.mag_filter].contains(&cubic) {
++        return Ok(*descriptor);
++    }
++    if renderbox_compatibility
++        && descriptor.min_filter == cubic
++        && descriptor.mag_filter == cubic
++        && descriptor.mip_filter == SamplerMipFilter::NotMipmapped
++        && descriptor.normalized_coordinates
++        && descriptor.lod_average
++        && descriptor.compare_function == CompareFunction::Never
++        && descriptor.max_anisotropy == 1
++        && [descriptor.s_address_mode, descriptor.t_address_mode, descriptor.r_address_mode]
++            == [MetalAddressMode::ClampToEdge; 3]
++    {
++        let mut effective = *descriptor;
++        effective.min_filter = SamplerMinMagFilter::Linear;
++        effective.mag_filter = SamplerMinMagFilter::Linear;
++        return Ok(effective);
++    }
++    Err(Error::Unsupported(Gap::CubicSampler))
++}
++
++#[cfg(test)]
++#[test]
++fn renderbox_cubic_sampler_uses_linear_on_ios() {
++    let ordinary = SamplerDescriptor::new();
++    let mut renderbox = ordinary;
++    renderbox.min_filter = SamplerMinMagFilter::Cubic;
++    renderbox.mag_filter = SamplerMinMagFilter::Cubic;
++    renderbox.lod_average = true;
++    let effective = device_sampler_descriptor(&renderbox, true).unwrap();
++    assert_eq!(effective.min_filter, SamplerMinMagFilter::Linear);
++    assert_eq!(effective.mag_filter, SamplerMinMagFilter::Linear);
++    assert_ne!(SamplerWord::of(&effective).0, SamplerWord::of(&renderbox).0);
++    assert_eq!(device_sampler_descriptor(&ordinary, true).unwrap(), ordinary);
++    assert!(device_sampler_descriptor(&renderbox, false).is_err());
++    renderbox.mip_filter = SamplerMipFilter::Linear;
++    assert!(device_sampler_descriptor(&renderbox, true).is_err());
++}
++
+ /// Makes the `VkSampler` of `desc`.
+ fn make(core: &Core, desc: &SamplerDesc) -> Result<vk::Sampler, Error> {
+     let mut reduction = vk::SamplerReductionModeCreateInfo::default();

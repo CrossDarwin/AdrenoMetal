@@ -6,13 +6,14 @@ use std::ptr::NonNull;
 pub struct HostMapping {
     address: usize,
     length: usize,
+    read_only: bool,
 }
 
 impl HostMapping {
-    /// Alias the caller's writable, page-aligned range without copying its pages.
+    /// Alias the caller's page-aligned range without copying or changing its protection.
     /// The caller must own and keep the range valid until this method returns.
     #[cfg(target_vendor = "apple")]
-    pub unsafe fn alias(pointer: NonNull<u8>, length: u64) -> Result<Self, String> {
+    pub unsafe fn alias(pointer: NonNull<u8>, length: u64, allow_read_only: bool) -> Result<Self, String> {
         unsafe extern "C" {
             static mach_task_self_: u32;
             fn mach_vm_remap(
@@ -59,7 +60,9 @@ impl HostMapping {
         if status != 0 {
             return Err(format!("host import remap failed: {status}"));
         }
-        if current & 3 != 3 || address == 0 {
+        let readable = current & libc::PROT_READ != 0;
+        let read_only = current & libc::PROT_WRITE == 0;
+        if !readable || (read_only && !allow_read_only) || address == 0 {
             // SAFETY: release only the alias this call created; never alter the caller's protection.
             unsafe {
                 mach_vm_deallocate(mach_task_self_, address, length);
@@ -69,17 +72,22 @@ impl HostMapping {
         Ok(Self {
             address: address as usize,
             length: length_usize,
+            read_only,
         })
     }
 
     #[cfg(not(target_vendor = "apple"))]
-    pub unsafe fn alias(_pointer: NonNull<u8>, _length: u64) -> Result<Self, String> {
+    pub unsafe fn alias(_pointer: NonNull<u8>, _length: u64, _allow_read_only: bool) -> Result<Self, String> {
         Err("stable host aliases require the Darwin VM API".into())
     }
 
     pub fn pointer(&self) -> NonNull<u8> {
         // SAFETY: construction rejects address zero, and this value owns the mapping.
         unsafe { NonNull::new_unchecked(self.address as *mut u8) }
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -117,7 +125,7 @@ mod tests {
             assert_ne!(original, libc::MAP_FAILED);
             std::ptr::write_bytes(original, 0x31, length);
             let alias =
-                HostMapping::alias(NonNull::new(original.cast::<u8>()).unwrap(), length as u64)
+                HostMapping::alias(NonNull::new(original.cast::<u8>()).unwrap(), length as u64, false)
                     .unwrap();
             assert_eq!(libc::munmap(original, length), 0);
             let replacement = libc::mmap(
@@ -172,11 +180,15 @@ mod tests {
             );
             assert_ne!(original, libc::MAP_FAILED);
             let pointer = NonNull::new(original.cast::<u8>()).unwrap();
-            assert!(HostMapping::alias(pointer, length as u64).is_err());
+            assert!(HostMapping::alias(pointer, length as u64, false).is_err());
+            let alias = HostMapping::alias(pointer, length as u64, true).unwrap();
+            assert!(alias.read_only());
+            assert_eq!(std::ptr::read_volatile(alias.pointer().as_ptr()), 0);
             assert!(
                 HostMapping::alias(
                     NonNull::new(pointer.as_ptr().add(1)).unwrap(),
-                    length as u64
+                    length as u64,
+                    true,
                 )
                 .is_err()
             );
