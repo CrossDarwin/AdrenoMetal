@@ -1,0 +1,21 @@
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index ad68e2e..dc23d31 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -745,11 +745,14 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       layout->ubwc = ubwc_enabled;
+ 
+       constexpr VkImageUsageFlags host_sample_usage =
+-         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+       constexpr VkImageUsageFlags host_color_usage =
+          host_sample_usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++         VK_IMAGE_USAGE_STORAGE_BIT |
+          VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
++      /* Transfer commands address texel regions. Transfer destination usage
++       * alone does not make the image a GMEM attachment. */
+       const bool host_sample =
+          (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+          !(image->vk.usage & ~host_sample_usage);

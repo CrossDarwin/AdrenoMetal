@@ -41,6 +41,15 @@ one 16 MiB reserve per memory class. Imported memory keeps a stable Darwin VM
 alias until the Vulkan import is released, so reuse of the caller's virtual
 address does not redirect a live import to different pages.
 
+On the Uke iPadOS build, eligible single-plane IOSurface textures and
+textures over shared host imports bind a linear Vulkan image to the imported
+pages for sampling and rendering. The bridge checks write permission, and the
+runtime checks image features, pitch, offset alignment and backing bounds.
+Read-only mappings and incompatible layouts use the existing copy path.
+The Uke build applies the host image patches to a temporary copy of the pinned
+runtime. The periodic `RT2` rows report backing counts and fallback upload
+and writeback bytes for each of the three texture entry points.
+
 Automatic heaps allocate free ranges. Placement heaps validate explicit offsets.
 `makeAliasable` releases a heap range; subsequent overlapping use requires the
 caller's Metal synchronization.

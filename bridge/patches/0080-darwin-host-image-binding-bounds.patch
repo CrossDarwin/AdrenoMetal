@@ -1,0 +1,166 @@
+diff --git a/crates/metal2vulkan-runtime/src/counters.rs b/crates/metal2vulkan-runtime/src/counters.rs
+index b56de42..5b34080 100644
+--- a/crates/metal2vulkan-runtime/src/counters.rs
++++ b/crates/metal2vulkan-runtime/src/counters.rs
+@@ -550,10 +550,16 @@ pub(crate) enum OverCause {
+     Alignment,
+     /// The linear image's other memory requirements ([`Metrics::over_copies_image_memory`]).
+     ImageMemory,
++    /// The texture rows exceed the Darwin texture's supplied range.
++    HostTextureBounds,
++    /// The imported memory type cannot bind the image, or it requires a dedicated allocation.
++    HostBindingType,
++    /// The Vulkan image allocation exceeds the allowed import range.
++    HostBindingSize,
+ }
+ 
+ /// The number of [`OverCause`]s.
+-const OVER_CAUSES: usize = OverCause::ImageMemory as usize + 1;
++const OVER_CAUSES: usize = OverCause::HostBindingSize as usize + 1;
+ 
+ /// No Metal counterpart: a device's counters ([`Device::counters`](crate::Device::counters)).
+ ///
+@@ -1253,7 +1259,11 @@ impl Counters {
+             a.over_copies_imported.fetch_add(1, Relaxed);
+             a.over_copy_bytes_imported.fetch_add(bytes, Relaxed);
+         }
+-        let [copies, copy_bytes] = &a.over_by_cause[cause as usize];
++        let category = match cause {
++            OverCause::HostTextureBounds | OverCause::HostBindingType | OverCause::HostBindingSize => OverCause::ImageMemory,
++            cause => cause,
++        };
++        let [copies, copy_bytes] = &a.over_by_cause[category as usize];
+         copies.fetch_add(1, Relaxed);
+         copy_bytes.fetch_add(bytes, Relaxed);
+     }
+@@ -1276,12 +1286,12 @@ impl Counters {
+         self.atomics.host_texture_copy_bytes[source as usize].each_ref().map(|bytes| bytes.load(Relaxed))
+     }
+ 
+-    /// Linear texture fallback bytes due to host backing, pitch, and binding alignment,
+-    /// extent or allocation bounds, respectively.
+-    pub fn darwin_linear_texture_copy_causes(&self) -> [u64; 5] {
++    /// Linear texture fallback bytes by layout and memory binding check.
++    pub fn darwin_linear_texture_copy_causes(&self) -> [u64; 8] {
+         let bytes = &self.atomics.linear_texture_copy_causes;
+         [OverCause::HostMemory, OverCause::Pitch, OverCause::Alignment,
+-            OverCause::RenderReach, OverCause::ImageMemory]
++            OverCause::RenderReach, OverCause::ImageMemory, OverCause::HostTextureBounds,
++            OverCause::HostBindingType, OverCause::HostBindingSize]
+             .map(|cause| bytes[cause as usize].load(Relaxed))
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/tests/over_causes.rs b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+index 0d96663..d1dd487 100644
+--- a/crates/metal2vulkan-runtime/src/tests/over_causes.rs
++++ b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+@@ -48,7 +48,10 @@ fn pair(metrics: &Metrics, cause: OverCause) -> (u64, u64) {
+         OverCause::Pitch => (m.over_copies_pitch, m.over_copy_bytes_pitch),
+         OverCause::RenderReach => (m.over_copies_render_reach, m.over_copy_bytes_render_reach),
+         OverCause::Alignment => (m.over_copies_alignment, m.over_copy_bytes_alignment),
+-        OverCause::ImageMemory => (m.over_copies_image_memory, m.over_copy_bytes_image_memory),
++        OverCause::ImageMemory
++        | OverCause::HostTextureBounds
++        | OverCause::HostBindingType
++        | OverCause::HostBindingSize => (m.over_copies_image_memory, m.over_copy_bytes_image_memory),
+     }
+ }
+ 
+@@ -89,6 +92,22 @@ fn each_cause_counts_in_its_own_pair_alone() {
+     }
+ }
+ 
++#[test]
++fn darwin_host_binding_rejections_keep_the_image_memory_total() {
++    let counters = Counters::new();
++    for (cause, bytes) in [
++        (OverCause::HostTextureBounds, 64),
++        (OverCause::HostBindingType, 128),
++        (OverCause::HostBindingSize, 256),
++    ] {
++        counters.over_copied(bytes, true, cause);
++        counters.copied_host_texture(crate::HostTextureSource::Linear, bytes, true, false, cause);
++    }
++    let metrics = counters.metrics();
++    assert_eq!((metrics.over_copies_image_memory, metrics.over_copy_bytes_image_memory), (3, 448));
++    assert_eq!(counters.darwin_linear_texture_copy_causes(), [0, 0, 0, 0, 0, 64, 128, 256]);
++}
++
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod on_device {
+     use super::moved;
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 0dcd9e9..ba27205 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1525,7 +1525,13 @@ impl Device {
+         // SAFETY: the device is live, and `plan` was checked against its image format query; a
+         // heap's or a buffer's block is the device's, and the texture holds it.
+         let mut made = unsafe { make(core, &d, &shape, &plan, bind) };
+-        if matches!(made, Err(Unmade::Unfit(OverCause::Pitch))) && core.exports.modifiers {
++        // Turnip's implicit linear layout can round a single layer up to
++        // 4 KiB. The explicit layout can fit the same rows without that tail.
++        if matches!(
++            made,
++            Err(Unmade::Unfit(OverCause::Pitch | OverCause::HostBindingSize))
++        ) && core.exports.modifiers
++        {
+             if let (Some(Laid::DarwinHost { usage, .. }), Bind::InPlace { bytes_per_row, explicit_pitch, .. }) =
+                 (laid, &mut bind)
+             {
+@@ -1959,7 +1965,7 @@ fn check_over(
+                     .checked_mul(bytes_per_row)
+                     .is_none_or(|rows| rows > surface.len)
+             {
+-                return Ok(Err(OverCause::ImageMemory));
++                return Ok(Err(OverCause::HostTextureBounds));
+             }
+             let mut usage = plan.linear_usage();
+             if !surface.writable {
+@@ -3087,7 +3093,7 @@ impl Made {
+             memory,
+             base,
+             memory_type,
+-            handle: _,
++            handle,
+             usage: _,
+             block_len,
+             at,
+@@ -3107,19 +3113,20 @@ impl Made {
+             };
+             // SAFETY: the image is the device's, linear, of one level and layer of a color format.
+             let layout = unsafe { device.get_image_subresource_layout(image, color) };
+-            let memory_fits = dedicated.requires_dedicated_allocation == vk::FALSE
+-                && bits & (1 << memory_type) != 0
+-                && at
+-                    .checked_add(requirements.size)
+-                    .is_some_and(|end| end <= block_len);
++            let host_import = handle == Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let type_fits = dedicated.requires_dedicated_allocation == vk::FALSE
++                && bits & (1 << memory_type) != 0;
++            let size_fits = at.checked_add(requirements.size).is_some_and(|end| end <= block_len);
+             let unfit = if layout.offset != 0 || layout.row_pitch != bytes_per_row {
+                 Some(OverCause::Pitch)
+             } else if !in_reach(layout.size, reach) {
+                 Some(OverCause::RenderReach)
+             } else if !(base + at).is_multiple_of(requirements.alignment) {
+                 Some(OverCause::Alignment)
+-            } else if !memory_fits {
+-                Some(OverCause::ImageMemory)
++            } else if !type_fits {
++                Some(if host_import { OverCause::HostBindingType } else { OverCause::ImageMemory })
++            } else if !size_fits {
++                Some(if host_import { OverCause::HostBindingSize } else { OverCause::ImageMemory })
+             } else {
+                 None
+             };
+@@ -5295,6 +5302,9 @@ impl Texture {
+             Form::Copied(OverCause::RenderReach) => "render-reach",
+             Form::Copied(OverCause::Alignment) => "alignment",
+             Form::Copied(OverCause::ImageMemory) => "image-memory",
++            Form::Copied(OverCause::HostTextureBounds) => "host-texture-bounds",
++            Form::Copied(OverCause::HostBindingType) => "host-binding-type",
++            Form::Copied(OverCause::HostBindingSize) => "host-binding-size",
+             _ => "backing",
+         })
+     }

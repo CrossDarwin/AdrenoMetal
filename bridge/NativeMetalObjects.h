@@ -200,7 +200,7 @@ bool nmb_device_heap_texture_size_and_align(const NmbDevice *, const struct NmbT
 bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
-NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
+NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t surface_len);
 // A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size and plane 1's offset and rows.
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
                                        uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
@@ -480,6 +480,7 @@ void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
    Version-1 statistics queries return false under runtime v2; their layouts are not equivalent. */
 bool nmb_device_runtime_metrics(const NmbDevice *, uint64_t *out);
 /* Two cumulative counters for copies between imported host buffers and their texture images. */
+bool nmb_device_host_texture_metrics(const NmbDevice *, uint64_t out[45]);
 bool nmb_device_host_texture_copies(const NmbDevice *, uint64_t out[2]);
 
 #ifdef __cplusplus

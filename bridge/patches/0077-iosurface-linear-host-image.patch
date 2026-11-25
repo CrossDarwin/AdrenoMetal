@@ -1,0 +1,446 @@
+diff --git a/crates/metal2vulkan-runtime/src/counters.rs b/crates/metal2vulkan-runtime/src/counters.rs
+index 3f4e338..10f2770 100644
+--- a/crates/metal2vulkan-runtime/src/counters.rs
++++ b/crates/metal2vulkan-runtime/src/counters.rs
+@@ -661,6 +661,7 @@ struct Atomics {
+     over_copy_bytes: AtomicU64,
+     over_copies_imported: AtomicU64,
+     over_copy_bytes_imported: AtomicU64,
++    iosurface_copy_bytes: [AtomicU64; 2],
+     /// Each [`OverCause`]'s over-copies, at its index: their count and bytes.
+     over_by_cause: [[AtomicU64; 2]; OVER_CAUSES],
+     attachment_read_copies: AtomicU64,
+@@ -1256,6 +1257,15 @@ impl Counters {
+         copy_bytes.fetch_add(bytes, Relaxed);
+     }
+ 
++    pub(crate) fn copied_iosurface(&self, bytes: u64, into: bool) {
++        self.atomics.iosurface_copy_bytes[usize::from(!into)].fetch_add(bytes, Relaxed);
++    }
++
++    /// Cumulative IOSurface fallback bytes recorded as uploads and writebacks.
++    pub fn darwin_iosurface_copy_bytes(&self) -> [u64; 2] {
++        self.atomics.iosurface_copy_bytes.each_ref().map(|bytes| bytes.load(Relaxed))
++    }
++
+     /// `copies` more copies of attachments' images into their shadows, of `bytes`
+     /// ([`Metrics::attachment_read_copies`], [`Metrics::attachment_read_copy_bytes`]), which
+     /// count in [`Metrics::bytes_copied`] too.
+diff --git a/crates/metal2vulkan-runtime/src/over.rs b/crates/metal2vulkan-runtime/src/over.rs
+index 0d07704..8a63336 100644
+--- a/crates/metal2vulkan-runtime/src/over.rs
++++ b/crates/metal2vulkan-runtime/src/over.rs
+@@ -499,6 +499,9 @@ pub(crate) unsafe fn record_side(
+                 ),
+             }
+             counters.over_copied(copy.bytes, copy.imported, copy.cause);
++            if copy.iosurface {
++                counters.copied_iosurface(copy.bytes, into);
++            }
+         }
+         device.cmd_pipeline_barrier2(
+             command,
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 9ffe84f..c019cc1 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -342,6 +342,7 @@ struct Named {
+     /// A place for each level and slice, in order.
+     places: Vec<BytesPlace>,
+     form: Form,
++    iosurface: bool,
+ }
+ 
+ /// How a texture's image holds its named bytes.
+@@ -721,12 +722,12 @@ impl Image {
+     }
+ 
+     /// The layout a copy names the image in, for `transfer`, its role's transfer layout: home,
+-    /// general, for an image whose move home starts preinitialized (a linear image over a buffer
+-    /// in place), which stays in a host-accessible layout through every use, copies included, so
++    /// general, for a linear image over a buffer in place, which uses a host-accessible
++    /// layout for copies as well as other access, so
+     /// that it and the buffer are aliases that interpret their bytes alike (Vulkan's memory
+     /// aliasing); `transfer` for any other image.
+     pub(crate) fn copy_layout(&self, transfer: vk::ImageLayout) -> vk::ImageLayout {
+-        match self.first == vk::ImageLayout::PREINITIALIZED || self.surface() {
++        match matches!(self._under, Some(Under::Buffer { .. })) || self.surface() {
+             true => self.home,
+             false => transfer,
+         }
+@@ -1414,11 +1415,13 @@ impl Device {
+                     buffer: Arc::clone(bytes.object()),
+                     places: places.to_vec(),
+                     form: Form::Managed,
++                    iosurface: false,
+                 };
+                 (Some(named), vk::ImageLayout::UNDEFINED, plan.home)
+             }
+-            Source::Over(buffer, offset, bytes_per_row) => {
+-                let checked = check_over(core, &d, &shape, &plan, buffer, *offset, *bytes_per_row)?;
++            Source::Over(buffer, offset, bytes_per_row, surface) => {
++                let checked =
++                    check_over(core, &d, &shape, &plan, buffer, *offset, *bytes_per_row, *surface)?;
+                 laid = checked.ok();
+                 let named = Named {
+                     buffer: Arc::clone(buffer.object()),
+@@ -1427,6 +1430,7 @@ impl Device {
+                         bytes_per_row: *bytes_per_row,
+                         bytes_per_image: 0,
+                     }],
++                    iosurface: surface.is_some(),
+                     form: match checked {
+                         Ok(_) => Form::InPlace,
+                         Err(cause) => Form::Copied(cause),
+@@ -1461,7 +1465,7 @@ impl Device {
+             {
+                 (Bind::Pooled, None)
+             }
+-            Source::Over(buffer, offset, bytes_per_row) => {
++            Source::Over(buffer, offset, bytes_per_row, surface) => {
+                 // The bytes shaders reach: a Managed buffer's device copy, where it has one.
+                 let (memory, class, at) = match buffer.held() {
+                     (_, Some(copy)) => (copy.memory(), MemoryClass::Private, copy.offset()),
+@@ -1478,6 +1482,12 @@ impl Device {
+                         let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+                         (memory_type, Some(handle))
+                     }
++                    Some(Laid::DarwinHost { memory_type, .. }) => {
++                        // The bundled Turnip transitions external linear host
++                        // images without clearing or rewriting the texels.
++                        first = vk::ImageLayout::UNDEFINED;
++                        (memory_type, Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT))
++                    }
+                     _ => (core.memory_type(class), None),
+                 };
+                 let rows = u64::from(d.height) * bytes_per_row;
+@@ -1488,7 +1498,16 @@ impl Device {
+                     base: memory.base(),
+                     memory_type,
+                     handle,
+-                    block_len: memory.len,
++                    usage: match laid {
++                        Some(Laid::DarwinHost { usage, .. }) => usage,
++                        _ => plan.linear_usage(),
++                    },
++                    block_len: match (laid, surface) {
++                        (Some(Laid::DarwinHost { .. }), Some(surface)) => {
++                            memory.len.min(at + offset + surface.len)
++                        }
++                        _ => memory.len,
++                    },
+                     at: at + offset,
+                     bytes_per_row,
+                     reach,
+@@ -1522,9 +1541,17 @@ impl Device {
+         // (`Plan::linear_usage`); any other keeps its home, shader-read-only or general, which a
+         // pass moves it from to the feedback layout and back.
+         let laid_over = named.as_ref().is_some_and(|n| n.form == Form::InPlace);
+-        let attachment_reads = plan.attachment_reads && !laid_over;
+-        // On a device without the feedback loop, a draw reads such an image through its shadow.
+-        let shadowing = (attachment_reads && core.feedback.is_none()).then(|| {
++        let darwin_usage = match laid {
++            Some(Laid::DarwinHost { usage, .. }) if laid_over => Some(usage),
++            _ => None,
++        };
++        let attachment_reads = plan.attachment_reads && (!laid_over || darwin_usage.is_some());
++        let looped = darwin_usage.map_or(core.feedback.is_some(), |usage| {
++            usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
++        });
++        // A Darwin surface retains framebuffer fetch, through the attachment
++        // feedback loop or the same lazy shadow used by exported planes.
++        let shadowing = (attachment_reads && !looped).then(|| {
+             Box::new(Shadowing {
+                 made: (d, shape, plan.shadow()),
+                 shadow: Mutex::new(None),
+@@ -1545,7 +1572,7 @@ impl Device {
+             format: plan.format,
+             // A linear image in place takes no attachment usage for a resolve alone.
+             usage: match laid_over {
+-                true => plan.usage,
++                true => darwin_usage.unwrap_or(plan.usage),
+                 false => plan.image_usage(),
+             },
+             view_formats: plan.view_formats.clone(),
+@@ -1844,6 +1871,7 @@ fn check_over(
+     buffer: &Buffer,
+     offset: u64,
+     bytes_per_row: u64,
++    surface: Option<DarwinSurface>,
+ ) -> Result<Result<Laid, OverCause>, Error> {
+     let gap = || {
+         Error::Unsupported(Gap::TextureOverBuffer {
+@@ -1885,6 +1913,44 @@ fn check_over(
+     // many imports. Over an exported block, the copy too: its memory is dedicated to its buffer,
+     // and no image is bound in it (VUID-vkBindImageMemory-memory-10926).
+     let laid = match (copy, block.memory.own) {
++        (
++            None,
++            Some(Own::Import {
++                handle: ImportHandle::HostMemory,
++                memory_type,
++            }),
++        ) if surface.is_some_and(|surface| surface.writable) => {
++            let surface = surface.unwrap();
++            // Use the surface's unrounded extent within the page import.
++            if offset.checked_add(surface.len).is_none_or(|end| end > buffer.length())
++                || u64::from(d.height)
++                    .checked_mul(bytes_per_row)
++                    .is_none_or(|rows| rows > surface.len)
++            {
++                return Ok(Err(OverCause::ImageMemory));
++            }
++            let mut usage = plan.linear_usage();
++            if plan.attachment_reads {
++                let feedback_usage = usage
++                    | vk::ImageUsageFlags::SAMPLED
++                    | vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
++                let feedback = core.feedback.is_some()
++                    && linear_extent(
++                        core,
++                        shape,
++                        plan,
++                        feedback_usage,
++                        Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT),
++                    )
++                    .is_some_and(|max| d.width <= max.width && d.height <= max.height);
++                if feedback {
++                    usage = feedback_usage;
++                } else if !plan.shadow_offered(core, shape) {
++                    return Ok(Err(OverCause::LinearFeatures));
++                }
++            }
++            Laid::DarwinHost { memory_type, usage }
++        }
+         (Some(_), _) | (None, None) => Laid::Own,
+         (
+             None,
+@@ -1896,7 +1962,11 @@ fn check_over(
+         (None, Some(own)) => return Ok(Err(memory_cause(own))),
+     };
+     let spilled = copy.is_none() && block.memory.spilled();
+-    let extent = linear_extent(core, shape, plan, laid.handle())
++    let usage = match laid {
++        Laid::DarwinHost { usage, .. } => usage,
++        _ => plan.linear_usage(),
++    };
++    let extent = linear_extent(core, shape, plan, usage, laid.handle())
+         .is_some_and(|max| d.width <= max.width && d.height <= max.height);
+     let (linear, optimal) = core.format_features(plan.format);
+     let features = linear.contains(optimal & kept_features(plan.usage));
+@@ -1906,7 +1976,7 @@ fn check_over(
+         // A dma-buf's linear image is asked of its external query for the handle.
+         Err(match laid {
+             Laid::DmaBuf { .. } => OverCause::DmaBuf,
+-            Laid::Own => OverCause::Linear,
++            Laid::Own | Laid::DarwinHost { .. } => OverCause::Linear,
+         })
+     } else if !features {
+         Err(OverCause::LinearFeatures)
+@@ -1944,6 +2014,10 @@ enum Laid {
+     /// is made for the dma-buf, undefined, and its move home acquires the bytes from the foreign
+     /// queue family, preinitialized ([`Image::homing`]).
+     DmaBuf { memory_type: u32 },
++    DarwinHost {
++        memory_type: u32,
++        usage: vk::ImageUsageFlags,
++    },
+ }
+ 
+ impl Laid {
+@@ -1952,6 +2026,7 @@ impl Laid {
+         match self {
+             Laid::Own => None,
+             Laid::DmaBuf { .. } => Some(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
++            Laid::DarwinHost { .. } => Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT),
+         }
+     }
+ }
+@@ -2008,6 +2083,7 @@ fn linear_extent(
+     core: &Core,
+     shape: &Shape,
+     plan: &Plan,
++    usage: vk::ImageUsageFlags,
+     handle: Option<vk::ExternalMemoryHandleTypeFlags>,
+ ) -> Option<vk::Extent3D> {
+     let mut list = plan.format_list();
+@@ -2015,7 +2091,7 @@ fn linear_extent(
+         .format(plan.format)
+         .ty(shape.image_type)
+         .tiling(vk::ImageTiling::LINEAR)
+-        .usage(plan.linear_usage())
++        .usage(usage)
+         .flags(plan.flags(shape));
+     if !plan.view_formats.is_empty() {
+         linear = linear.push_next(&mut list);
+@@ -2085,7 +2161,7 @@ fn linear_layout(
+     shape: &Shape,
+     plan: &Plan,
+ ) -> Option<(u64, u64, u64)> {
+-    let max = linear_extent(core, shape, plan, None)?;
++    let max = linear_extent(core, shape, plan, plan.linear_usage(), None)?;
+     if d.width > max.width || d.height > max.height {
+         return None;
+     }
+@@ -2755,7 +2831,14 @@ enum Source<'a> {
+     /// A block, a heap's range of it, and the texture's offset in the heap.
+     Heap(Arc<Block>, HeapRange, u64),
+     /// A buffer, the texture's offset in it and its rows' pitch.
+-    Over(&'a Buffer, u64, u64),
++    Over(&'a Buffer, u64, u64, Option<DarwinSurface>),
++}
++
++/// An explicitly selected IOSurface plane of a shared Darwin host import.
++#[derive(Clone, Copy)]
++struct DarwinSurface {
++    len: u64,
++    writable: bool,
+ }
+ 
+ /// Where [`make`] binds the image.
+@@ -2772,6 +2855,7 @@ enum Bind {
+         base: u64,
+         memory_type: u32,
+         handle: Option<vk::ExternalMemoryHandleTypeFlags>,
++        usage: vk::ImageUsageFlags,
+         block_len: u64,
+         at: u64,
+         bytes_per_row: u64,
+@@ -2869,10 +2953,8 @@ impl Made {
+         let info = image_info(d, shape, plan, &mut list);
+         let mut external = vk::ExternalMemoryImageCreateInfo::default();
+         let info = match bind {
+-            Bind::InPlace { handle, .. } => {
+-                let info = info
+-                    .tiling(vk::ImageTiling::LINEAR)
+-                    .usage(plan.linear_usage());
++            Bind::InPlace { handle, usage, .. } => {
++                let info = info.tiling(vk::ImageTiling::LINEAR).usage(usage);
+                 match handle {
+                     // Made for the import's handle (`VUID-vkBindImageMemory-memory-02989`), so
+                     // undefined (`VUID-VkImageCreateInfo-pNext-01443`).
+@@ -2919,6 +3001,7 @@ impl Made {
+             base,
+             memory_type,
+             handle: _,
++            usage: _,
+             block_len,
+             at,
+             bytes_per_row,
+@@ -3922,6 +4005,7 @@ impl Texture {
+                 buffer: named.buffer.clone(),
+                 places: levels.clone().flat_map(level_places).collect(),
+                 form: named.form,
++                iosurface: named.iosurface,
+             }
+         });
+         let view = TextureInner {
+@@ -4923,6 +5007,7 @@ pub(crate) trait TextureObject {
+             },
+             bytes: u64::from(d.width) * u64::from(d.height) * u64::from(unit.bytes),
+             shared: named.buffer.is_shared(),
++            iosurface: named.iosurface,
+             imported: device_copy.is_none() && block.memory.imported(),
+             cause,
+         };
+@@ -5054,9 +5139,57 @@ impl Buffer {
+         offset: u64,
+         bytes_per_row: u64,
+     ) -> Result<Texture, Error> {
+-        self.texture_over(descriptor, Reach::Index(index), offset, bytes_per_row)
++        self.texture_over(descriptor, Reach::Index(index), offset, bytes_per_row, None)
++    }
++
++    /// Creates an IOSurface plane over an import used with the bundled Darwin
++    /// Turnip backend. Unsupported layouts use the regular copy path.
++    ///
++    /// # Safety
++    /// The caller has verified the backend preserves imported linear pixels
++    /// on the first layout transition. The shared import starts at the
++    /// IOSurface base and the caller retains the surface until import release.
++    /// `len` bounds the bytes of the plane starting at `offset`. A writable
++    /// mapping permits every Vulkan write, including blit writes.
++    #[cfg(target_os = "ios")]
++    pub unsafe fn new_darwin_surface_texture(
++        &self,
++        descriptor: &TextureDescriptor,
++        index: Option<u32>,
++        offset: u64,
++        bytes_per_row: u64,
++        len: u64,
++        writable: bool,
++    ) -> Result<Texture, Error> {
++        self.texture_over(
++            descriptor,
++            Reach::Index(index),
++            offset,
++            bytes_per_row,
++            Some(DarwinSurface { len, writable }),
++        )
++    }
++}
++
++impl Texture {
++    /// Backing selected for a texture created by `Buffer::new_darwin_surface_texture`.
++    pub fn darwin_surface_backing(&self) -> Option<&'static str> {
++        let named = self.object().named.as_ref().filter(|named| named.iosurface)?;
++        Some(match named.form {
++            Form::InPlace => "in-place",
++            Form::Copied(OverCause::HostMemory) => "host-memory",
++            Form::Copied(OverCause::Linear) => "linear-format-or-extent",
++            Form::Copied(OverCause::LinearFeatures) => "linear-features",
++            Form::Copied(OverCause::Pitch) => "pitch",
++            Form::Copied(OverCause::RenderReach) => "render-reach",
++            Form::Copied(OverCause::Alignment) => "alignment",
++            Form::Copied(OverCause::ImageMemory) => "image-memory",
++            _ => "backing",
++        })
+     }
++}
+ 
++impl Buffer {
+     /// A surface plane's texture over this buffer, as [`Buffer::new_texture`] makes it, but that
+     /// with no index a plane shaders read or write is reached through its views alone
+     /// ([`Device::new_texture_for_views`]).
+@@ -5071,7 +5204,7 @@ impl Buffer {
+             Some(_) => Reach::Index(index),
+             None => Reach::Views,
+         };
+-        self.texture_over(descriptor, reach, offset, bytes_per_row)
++        self.texture_over(descriptor, reach, offset, bytes_per_row, None)
+     }
+ 
+     fn texture_over(
+@@ -5080,6 +5213,7 @@ impl Buffer {
+         reach: Reach,
+         offset: u64,
+         bytes_per_row: u64,
++        surface: Option<DarwinSurface>,
+     ) -> Result<Texture, Error> {
+         let mut d = *descriptor;
+         d.storage_mode = match self.held() {
+@@ -5094,7 +5228,7 @@ impl Buffer {
+                 .device()
+                 .texel_texture(&d, reach, self, offset, bytes_per_row);
+         }
+-        let over = Source::Over(self, offset, bytes_per_row);
++        let over = Source::Over(self, offset, bytes_per_row, surface);
+         self.device().texture(&d, reach, over)
+     }
+ }
+@@ -5341,6 +5475,7 @@ impl Device {
+                 bytes_per_image: 0,
+             }],
+             form: Form::InPlace,
++            iosurface: false,
+         };
+         let inner = TextureInner {
+             consumer: std::sync::Mutex::default(),
+@@ -5400,6 +5535,7 @@ pub(crate) struct OverCopy {
+     pub(crate) shared: bool,
+     /// The bytes shaders reach are in an imported block (`Metrics::over_copies_imported`).
+     pub(crate) imported: bool,
++    pub(crate) iosurface: bool,
+     /// Why the texture is not in place: the pair of [`Metrics`](crate::Metrics) its copies count
+     /// in too.
+     pub(crate) cause: OverCause,

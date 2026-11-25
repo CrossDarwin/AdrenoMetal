@@ -1,0 +1,54 @@
+diff --git a/src/freedreno/fdl/freedreno_layout.h b/src/freedreno/fdl/freedreno_layout.h
+index fcead9d..a75dd9c 100644
+--- a/src/freedreno/fdl/freedreno_layout.h
++++ b/src/freedreno/fdl/freedreno_layout.h
+@@ -111,7 +111,7 @@ struct fdl_image_params {
+    bool sparse;
+ 
+    bool force_disable_linear_fallback;
+-   /* An explicit, read-only host image cannot participate in a GMEM load/store. */
++   /* The driver handles access to an explicit host image without padded rows. */
+    bool tight_linear_rows;
+ 
+    uint32_t plane;
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index d5e2c5a..ad68e2e 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -744,6 +744,22 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       layout->tile_mode = tile_mode;
+       layout->ubwc = ubwc_enabled;
+ 
++      constexpr VkImageUsageFlags host_sample_usage =
++         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      constexpr VkImageUsageFlags host_color_usage =
++         host_sample_usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++         VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
++      const bool host_sample =
++         (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
++         !(image->vk.usage & ~host_sample_usage);
++      /* The unpadded attachment paths bound GMEM loads and stores to the
++       * color image's actual extent (tu_attachment_unpadded). */
++      const bool host_color =
++         (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++         !(image->vk.usage & ~host_color_usage) &&
++         vk_format_aspects(image->vk.format) == VK_IMAGE_ASPECT_COLOR_BIT;
++
+       struct fdl_image_params params = {
+          .format = format,
+          .nr_samples = image->vk.samples,
+@@ -762,9 +778,11 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+          .force_disable_linear_fallback = force_disable_linear_fallback,
+          .tight_linear_rows =
+             plane_layouts && tile_mode == TILE6_LINEAR && !ubwc_enabled &&
++            image->vk.image_type == VK_IMAGE_TYPE_2D &&
++            image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
++            !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+             image->vk.external_handle_types == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT &&
+-            (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+-            !(image->vk.usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)),
++            (host_sample || host_color),
+          .plane = i,
+       };
+ 

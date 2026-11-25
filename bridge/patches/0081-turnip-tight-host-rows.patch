@@ -1,0 +1,42 @@
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+index 65c2054..fcfa5cd 100644
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -288,7 +288,7 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
+        * The pitch is already sufficiently aligned, but height
+        * may not be. note this only matters if last level is linear
+        */
+-      if (level == params->mip_levels - 1)
++      if (level == params->mip_levels - 1 && !params->tight_linear_rows)
+          nblocksy = align(nblocksy, 4);
+ 
+       slice->offset = offset + layout->size;
+diff --git a/src/freedreno/fdl/freedreno_layout.h b/src/freedreno/fdl/freedreno_layout.h
+index d0e482d..fcead9d 100644
+--- a/src/freedreno/fdl/freedreno_layout.h
++++ b/src/freedreno/fdl/freedreno_layout.h
+@@ -111,6 +111,8 @@ struct fdl_image_params {
+    bool sparse;
+ 
+    bool force_disable_linear_fallback;
++   /* An explicit, read-only host image cannot participate in a GMEM load/store. */
++   bool tight_linear_rows;
+ 
+    uint32_t plane;
+ };
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 8b0aef1..d5e2c5a 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -760,6 +760,11 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+          .sparse = image->vk.create_flags &
+             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+          .force_disable_linear_fallback = force_disable_linear_fallback,
++         .tight_linear_rows =
++            plane_layouts && tile_mode == TILE6_LINEAR && !ubwc_enabled &&
++            image->vk.external_handle_types == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT &&
++            (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
++            !(image->vk.usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)),
+          .plane = i,
+       };
+ 

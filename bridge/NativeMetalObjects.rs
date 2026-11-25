@@ -1319,14 +1319,15 @@ pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const Nmb
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
-                                            bytes_per_row: u64, iosurface: bool) -> *mut NmbTexture {
+                                            bytes_per_row: u64, surface_len: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
-        // IOSurface pages are imported once by the frontend. Runtime v2's ordinary
-        // buffer texture handles the image-in-place or synchronized-copy form.
-        let _ = iosurface;
-        let texture = buffer.new_texture(&descriptor, offset, bytes_per_row)?;
+        let texture = if surface_len == 0 {
+            buffer.new_texture(&descriptor, offset, bytes_per_row)?
+        } else {
+            Texture::over_iosurface(&buffer, &descriptor, offset, bytes_per_row, surface_len)?
+        };
         Ok(boxed(NmbTexture(Resource::tied(texture, tie))))
     })
 }
@@ -1344,7 +1345,7 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
             return Err(format!("upstream runtime-v2 has no YCbCr surface conversion: format={pixel_format:#x} plane={plane} surface={width}x{height} chroma={chroma_offset}/{chroma_bytes_per_row}"));
         }
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
-        let texture = buffer.new_texture(&descriptor, offset, bytes_per_row)?;
+        let texture = Texture::over_surface_plane(&buffer, &descriptor, offset, bytes_per_row)?;
         Ok(boxed(NmbTexture(Resource::tied(texture, tie))))
     })
 }
@@ -1373,7 +1374,7 @@ pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *co
             return Err("upstream runtime-v2 has no padded 3D texture-over-buffer layout".into());
         }
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
-        let texture = buffer.new_texture(&descriptor, offset, bytes_per_row)?;
+        let texture = Texture::over_linear(&buffer, &descriptor, offset, bytes_per_row)?;
         Ok(boxed(NmbTexture(Resource::tied(texture, tie))))
     })
 }
@@ -3590,6 +3591,25 @@ pub extern "C" fn nmb_device_runtime_metrics(device: *const NmbDevice, out: *mut
             m.first_use_waits, m.first_use_wait_nanos, m.held_releases, m.held_release_bytes];
         // SAFETY: the ABI names 32 writable words.
         unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len()); }
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_host_texture_metrics(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() { return Err("null host texture metrics output".into()); }
+        let counters = get(device)?.0.counters();
+        let sources = metal2vulkan_runtime::HostTextureSource::ALL;
+        // SAFETY: the ABI requires fifteen writable words per source.
+        let output = unsafe { std::slice::from_raw_parts_mut(out, 15 * sources.len()) };
+        for (source, words) in sources.into_iter().zip(output.chunks_exact_mut(15)) {
+            let [in_place, fallback, read_only] = crate::texture::host_texture_counts(source);
+            let [upload, writeback, read_only_upload] = counters.darwin_host_texture_copy_bytes(source);
+            let (totals, causes) = words.split_at_mut(6);
+            totals.copy_from_slice(&[in_place, fallback, upload, writeback, read_only, read_only_upload]);
+            causes.copy_from_slice(&counters.darwin_host_texture_copy_causes(source));
+        }
         Ok(true)
     })
 }

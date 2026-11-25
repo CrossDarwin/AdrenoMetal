@@ -1,0 +1,49 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index ef37204..8047b96 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1505,11 +1505,10 @@ impl Device {
+                         Some(Laid::DarwinHost { usage, .. }) => usage,
+                         _ => plan.linear_usage(),
+                     },
+-                    block_len: match (laid, surface) {
+-                        (Some(Laid::DarwinHost { .. }), Some(surface)) => {
+-                            memory.len.min(at + offset + surface.len)
+-                        }
+-                        _ => memory.len,
++                    block_len: memory.len,
++                    host_len: match (laid, surface) {
++                        (Some(Laid::DarwinHost { .. }), Some(surface)) => Some(surface.len),
++                        _ => None,
+                     },
+                     at: at + offset,
+                     explicit_pitch: false,
+@@ -2931,6 +2930,8 @@ enum Bind {
+         handle: Option<vk::ExternalMemoryHandleTypeFlags>,
+         usage: vk::ImageUsageFlags,
+         block_len: u64,
++        /// Host subresource limit, separate from the imported allocation size.
++        host_len: Option<u64>,
+         at: u64,
+         explicit_pitch: bool,
+         bytes_per_row: u64,
+@@ -3098,6 +3099,7 @@ impl Made {
+             handle,
+             usage: _,
+             block_len,
++            host_len,
+             at,
+             explicit_pitch,
+             bytes_per_row,
+@@ -3118,7 +3120,10 @@ impl Made {
+             let host_import = handle == Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+             let type_fits = dedicated.requires_dedicated_allocation == vk::FALSE
+                 && bits & (1 << memory_type) != 0;
+-            let size_fits = at.checked_add(requirements.size).is_some_and(|end| end <= block_len);
++            // The layout must fit in the logical surface. The Vulkan binding
++            // may also include allocation-only padding in the imported pages.
++            let size_fits = host_len.is_none_or(|len| layout.size <= len)
++                && at.checked_add(requirements.size).is_some_and(|end| end <= block_len);
+             let unfit = if layout.offset != 0 || layout.row_pitch != bytes_per_row {
+                 Some(OverCause::Pitch)
+             } else if !in_reach(layout.size, reach) {

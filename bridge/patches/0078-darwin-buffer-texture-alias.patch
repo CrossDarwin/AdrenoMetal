@@ -1,0 +1,245 @@
+diff --git a/crates/metal2vulkan-runtime/src/counters.rs b/crates/metal2vulkan-runtime/src/counters.rs
+index 10f2770..e451e8c 100644
+--- a/crates/metal2vulkan-runtime/src/counters.rs
++++ b/crates/metal2vulkan-runtime/src/counters.rs
+@@ -661,7 +661,7 @@ struct Atomics {
+     over_copy_bytes: AtomicU64,
+     over_copies_imported: AtomicU64,
+     over_copy_bytes_imported: AtomicU64,
+-    iosurface_copy_bytes: [AtomicU64; 2],
++    host_texture_copy_bytes: [[AtomicU64; 2]; crate::HostTextureSource::ALL.len()],
+     /// Each [`OverCause`]'s over-copies, at its index: their count and bytes.
+     over_by_cause: [[AtomicU64; 2]; OVER_CAUSES],
+     attachment_read_copies: AtomicU64,
+@@ -1257,13 +1257,14 @@ impl Counters {
+         copy_bytes.fetch_add(bytes, Relaxed);
+     }
+ 
+-    pub(crate) fn copied_iosurface(&self, bytes: u64, into: bool) {
+-        self.atomics.iosurface_copy_bytes[usize::from(!into)].fetch_add(bytes, Relaxed);
++    pub(crate) fn copied_host_texture(&self, source: crate::HostTextureSource, bytes: u64, into: bool) {
++        self.atomics.host_texture_copy_bytes[source as usize][usize::from(!into)]
++            .fetch_add(bytes, Relaxed);
+     }
+ 
+-    /// Cumulative IOSurface fallback bytes recorded as uploads and writebacks.
+-    pub fn darwin_iosurface_copy_bytes(&self) -> [u64; 2] {
+-        self.atomics.iosurface_copy_bytes.each_ref().map(|bytes| bytes.load(Relaxed))
++    /// Cumulative fallback upload and writeback bytes for the given bridge entry point.
++    pub fn darwin_host_texture_copy_bytes(&self, source: crate::HostTextureSource) -> [u64; 2] {
++        self.atomics.host_texture_copy_bytes[source as usize].each_ref().map(|bytes| bytes.load(Relaxed))
+     }
+ 
+     /// `copies` more copies of attachments' images into their shadows, of `bytes`
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 7aa3cf4..754aee1 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -154,6 +154,7 @@ pub use surface::{
+     PlaneLayout, PlaneSpec, Surface, SurfaceCopy, SurfaceExport, SurfaceForm, SurfaceSpec,
+ };
+ pub use texture::{
+-    BytesPlace, HeapRange, Region, SizeAndAlign, StorageMode, Texture, TextureDescriptor,
++    BytesPlace, HeapRange, HostTextureSource, Region, SizeAndAlign, StorageMode, Texture,
++    TextureDescriptor,
+ };
+ pub use times::{HOST_DOMAIN, host_time};
+diff --git a/crates/metal2vulkan-runtime/src/over.rs b/crates/metal2vulkan-runtime/src/over.rs
+index 8a63336..d273102 100644
+--- a/crates/metal2vulkan-runtime/src/over.rs
++++ b/crates/metal2vulkan-runtime/src/over.rs
+@@ -499,8 +499,8 @@ pub(crate) unsafe fn record_side(
+                 ),
+             }
+             counters.over_copied(copy.bytes, copy.imported, copy.cause);
+-            if copy.iosurface {
+-                counters.copied_iosurface(copy.bytes, into);
++            if let Some(source) = copy.host_texture {
++                counters.copied_host_texture(source, copy.bytes, into);
+             }
+         }
+         device.cmd_pipeline_barrier2(
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index c019cc1..550ea4f 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -342,7 +342,7 @@ struct Named {
+     /// A place for each level and slice, in order.
+     places: Vec<BytesPlace>,
+     form: Form,
+-    iosurface: bool,
++    host_texture: Option<HostTextureSource>,
+ }
+ 
+ /// How a texture's image holds its named bytes.
+@@ -1415,7 +1415,7 @@ impl Device {
+                     buffer: Arc::clone(bytes.object()),
+                     places: places.to_vec(),
+                     form: Form::Managed,
+-                    iosurface: false,
++                    host_texture: None,
+                 };
+                 (Some(named), vk::ImageLayout::UNDEFINED, plan.home)
+             }
+@@ -1430,7 +1430,7 @@ impl Device {
+                         bytes_per_row: *bytes_per_row,
+                         bytes_per_image: 0,
+                     }],
+-                    iosurface: surface.is_some(),
++                    host_texture: surface.map(|surface| surface.source),
+                     form: match checked {
+                         Ok(_) => Form::InPlace,
+                         Err(cause) => Form::Copied(cause),
+@@ -1871,7 +1871,7 @@ fn check_over(
+     buffer: &Buffer,
+     offset: u64,
+     bytes_per_row: u64,
+-    surface: Option<DarwinSurface>,
++    surface: Option<DarwinHostTexture>,
+ ) -> Result<Result<Laid, OverCause>, Error> {
+     let gap = || {
+         Error::Unsupported(Gap::TextureOverBuffer {
+@@ -1921,7 +1921,7 @@ fn check_over(
+             }),
+         ) if surface.is_some_and(|surface| surface.writable) => {
+             let surface = surface.unwrap();
+-            // Use the surface's unrounded extent within the page import.
++            // Use the supplied extent within the page import.
+             if offset.checked_add(surface.len).is_none_or(|end| end > buffer.length())
+                 || u64::from(d.height)
+                     .checked_mul(bytes_per_row)
+@@ -2831,14 +2831,32 @@ enum Source<'a> {
+     /// A block, a heap's range of it, and the texture's offset in the heap.
+     Heap(Arc<Block>, HeapRange, u64),
+     /// A buffer, the texture's offset in it and its rows' pitch.
+-    Over(&'a Buffer, u64, u64, Option<DarwinSurface>),
++    Over(&'a Buffer, u64, u64, Option<DarwinHostTexture>),
+ }
+ 
+-/// An explicitly selected IOSurface plane of a shared Darwin host import.
++/// Where the Darwin bridge creates a texture over an imported host buffer.
++#[derive(Clone, Copy, Debug)]
++#[repr(usize)]
++pub enum HostTextureSource {
++    /// A single-plane IOSurface.
++    IOSurface,
++    /// A texture created from a Metal buffer.
++    Buffer,
++    /// A texture created using Metal's linear texture entry point.
++    Linear,
++}
++
++impl HostTextureSource {
++    /// The sources in the order exported in the bridge metrics.
++    pub const ALL: [Self; 3] = [Self::IOSurface, Self::Buffer, Self::Linear];
++}
++
++/// Bounds and access of a shared Darwin host texture.
+ #[derive(Clone, Copy)]
+-struct DarwinSurface {
++struct DarwinHostTexture {
+     len: u64,
+     writable: bool,
++    source: HostTextureSource,
+ }
+ 
+ /// Where [`make`] binds the image.
+@@ -4005,7 +4023,7 @@ impl Texture {
+                 buffer: named.buffer.clone(),
+                 places: levels.clone().flat_map(level_places).collect(),
+                 form: named.form,
+-                iosurface: named.iosurface,
++                host_texture: named.host_texture,
+             }
+         });
+         let view = TextureInner {
+@@ -5007,7 +5025,7 @@ pub(crate) trait TextureObject {
+             },
+             bytes: u64::from(d.width) * u64::from(d.height) * u64::from(unit.bytes),
+             shared: named.buffer.is_shared(),
+-            iosurface: named.iosurface,
++            host_texture: named.host_texture,
+             imported: device_copy.is_none() && block.memory.imported(),
+             cause,
+         };
+@@ -5142,17 +5160,17 @@ impl Buffer {
+         self.texture_over(descriptor, Reach::Index(index), offset, bytes_per_row, None)
+     }
+ 
+-    /// Creates an IOSurface plane over an import used with the bundled Darwin
+-    /// Turnip backend. Unsupported layouts use the regular copy path.
++    /// Creates a texture over an import used with the bundled Darwin Turnip
++    /// backend. Unsupported layouts use the regular copy path.
+     ///
+     /// # Safety
+-    /// The caller has verified the backend preserves imported linear pixels
+-    /// on the first layout transition. The shared import starts at the
+-    /// IOSurface base and the caller retains the surface until import release.
+-    /// `len` bounds the bytes of the plane starting at `offset`. A writable
+-    /// mapping permits every Vulkan write, including blit writes.
++    /// The backend must preserve imported linear pixels on the first layout
++    /// transition. The host allocation must remain live until import release.
++    /// `len` bounds the backing bytes starting at `offset`, excluding any
++    /// bytes belonging to adjacent planes. A writable mapping must permit
++    /// all Vulkan writes, including blit writes.
+     #[cfg(target_os = "ios")]
+-    pub unsafe fn new_darwin_surface_texture(
++    pub unsafe fn new_darwin_host_texture(
+         &self,
+         descriptor: &TextureDescriptor,
+         index: Option<u32>,
+@@ -5160,21 +5178,23 @@ impl Buffer {
+         bytes_per_row: u64,
+         len: u64,
+         writable: bool,
++        source: HostTextureSource,
+     ) -> Result<Texture, Error> {
+         self.texture_over(
+             descriptor,
+             Reach::Index(index),
+             offset,
+             bytes_per_row,
+-            Some(DarwinSurface { len, writable }),
++            Some(DarwinHostTexture { len, writable, source }),
+         )
+     }
+ }
+ 
+ impl Texture {
+-    /// Backing selected for a texture created by `Buffer::new_darwin_surface_texture`.
+-    pub fn darwin_surface_backing(&self) -> Option<&'static str> {
+-        let named = self.object().named.as_ref().filter(|named| named.iosurface)?;
++    /// Backing selected for a texture created by `Buffer::new_darwin_host_texture`.
++    pub fn darwin_host_texture_backing(&self) -> Option<&'static str> {
++        let named = self.object().named.as_ref()?;
++        named.host_texture?;
+         Some(match named.form {
+             Form::InPlace => "in-place",
+             Form::Copied(OverCause::HostMemory) => "host-memory",
+@@ -5213,7 +5233,7 @@ impl Buffer {
+         reach: Reach,
+         offset: u64,
+         bytes_per_row: u64,
+-        surface: Option<DarwinSurface>,
++        surface: Option<DarwinHostTexture>,
+     ) -> Result<Texture, Error> {
+         let mut d = *descriptor;
+         d.storage_mode = match self.held() {
+@@ -5475,7 +5495,7 @@ impl Device {
+                 bytes_per_image: 0,
+             }],
+             form: Form::InPlace,
+-            iosurface: false,
++            host_texture: None,
+         };
+         let inner = TextureInner {
+             consumer: std::sync::Mutex::default(),
+@@ -5535,7 +5555,7 @@ pub(crate) struct OverCopy {
+     pub(crate) shared: bool,
+     /// The bytes shaders reach are in an imported block (`Metrics::over_copies_imported`).
+     pub(crate) imported: bool,
+-    pub(crate) iosurface: bool,
++    pub(crate) host_texture: Option<HostTextureSource>,
+     /// Why the texture is not in place: the pair of [`Metrics`](crate::Metrics) its copies count
+     /// in too.
+     pub(crate) cause: OverCause,

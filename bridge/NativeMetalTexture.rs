@@ -7,7 +7,7 @@ use metal2vulkan_runtime as rt;
 use std::ops::{Deref, Range};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering, Ordering::Relaxed},
 };
 
 fn needs_texture_index(format: PixelFormat, usage: TextureUsage) -> bool {
@@ -191,16 +191,80 @@ impl Texture {
         offset: u64,
         bytes_per_row: u64,
     ) -> Result<Self, String> {
+        Self::over_buffer_inner(buffer, descriptor, offset, bytes_per_row, Some(rt::HostTextureSource::Buffer), None)
+    }
+
+    pub(crate) fn over_iosurface(
+        buffer: &Buffer,
+        descriptor: &TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+        surface_len: u64,
+    ) -> Result<Self, String> {
+        Self::over_buffer_inner(
+            buffer, descriptor, offset, bytes_per_row, Some(rt::HostTextureSource::IOSurface),
+            Some(surface_len),
+        )
+    }
+
+    pub(crate) fn over_surface_plane(
+        buffer: &Buffer,
+        descriptor: &TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> Result<Self, String> {
+        Self::over_buffer_inner(buffer, descriptor, offset, bytes_per_row, None, None)
+    }
+
+    pub(crate) fn over_linear(
+        buffer: &Buffer,
+        descriptor: &TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> Result<Self, String> {
+        Self::over_buffer_inner(buffer, descriptor, offset, bytes_per_row, Some(rt::HostTextureSource::Linear), None)
+    }
+
+    fn over_buffer_inner(
+        buffer: &Buffer,
+        descriptor: &TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+        source: Option<rt::HostTextureSource>,
+        surface_len: Option<u64>,
+    ) -> Result<Self, String> {
         let device = buffer.device();
         let index = reserve_texture_index(device, descriptor.pixel_format, descriptor.usage)?;
-        let raw = (**buffer)
-            .new_texture(
-                &descriptor.runtime()?,
-                index.as_ref().map(rt::IndexReservation::index),
-                offset,
-                bytes_per_row,
-            )
-            .map_err(|e| format!("texture over buffer: {e:?}"))?;
+        let runtime = descriptor.runtime()?;
+        let slot = index.as_ref().map(rt::IndexReservation::index);
+        #[cfg(not(target_os = "ios"))]
+        let raw = {
+            let _ = (source, surface_len);
+            (**buffer).new_texture(&runtime, slot, offset, bytes_per_row)
+        };
+        #[cfg(target_os = "ios")]
+        let raw = match (
+            source,
+            buffer.host_import_writable(),
+            buffer.length().checked_sub(offset),
+        ) {
+            (Some(source), Some(writable), Some(remaining)) => {
+                let len = surface_len.unwrap_or(remaining);
+                // The bundled Turnip preserves linear host pages on layout
+                // transition. The import retains its stable VM alias until release.
+                let raw = unsafe {
+                    (**buffer).new_darwin_host_texture(
+                        &runtime, slot, offset, bytes_per_row, len, writable, source,
+                    )
+                };
+                if let Ok(texture) = &raw {
+                    note_host_texture(texture, source, descriptor, offset, bytes_per_row, writable);
+                }
+                raw
+            }
+            _ => (**buffer).new_texture(&runtime, slot, offset, bytes_per_row),
+        };
+        let raw = raw.map_err(|e| format!("texture over buffer: {e:?}"))?;
         Ok(Self {
             raw,
             descriptor: descriptor.clone(),
@@ -329,6 +393,45 @@ impl Texture {
         self.raw.backing_allocation_size()
     }
 }
+static HOST_TEXTURES: [[AtomicU64; 3]; rt::HostTextureSource::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; 3] }; rt::HostTextureSource::ALL.len()];
+
+#[cfg(target_os = "ios")]
+fn note_host_texture(
+    texture: &rt::Texture,
+    source: rt::HostTextureSource,
+    descriptor: &TextureDescriptor,
+    offset: u64,
+    row: u64,
+    writable: bool,
+) {
+    let Some(backing) = texture.darwin_host_texture_backing() else {
+        return;
+    };
+    let counts = &HOST_TEXTURES[source as usize];
+    if backing == "in-place" {
+        counts[0].fetch_add(1, Relaxed);
+    } else {
+        counts[1].fetch_add(1, Relaxed);
+        if !writable {
+            counts[2].fetch_add(1, Relaxed);
+        }
+        static MESSAGES: [AtomicU64; rt::HostTextureSource::ALL.len()] =
+            [const { AtomicU64::new(0) }; rt::HostTextureSource::ALL.len()];
+        if MESSAGES[source as usize].load(Relaxed) < 16
+            && std::env::var_os("SHENG_DIAG").is_some_and(|value| value == "1")
+            && MESSAGES[source as usize].fetch_add(1, Relaxed) < 16
+        {
+            eprintln!("NativeAdrenoMetal host texture fallback: {source:?} {backing} {:?} {}x{} pitch={row} offset={offset} writable={writable}",
+                descriptor.pixel_format, descriptor.width, descriptor.height);
+        }
+    }
+}
+
+pub(crate) fn host_texture_counts(source: rt::HostTextureSource) -> [u64; 3] {
+    HOST_TEXTURES[source as usize].each_ref().map(|count| count.load(Relaxed))
+}
+
 impl Buffer {
     pub fn new_texture(
         &self,

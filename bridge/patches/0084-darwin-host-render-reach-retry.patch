@@ -1,0 +1,21 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index ba27205..ef37204 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1525,11 +1525,13 @@ impl Device {
+         // SAFETY: the device is live, and `plan` was checked against its image format query; a
+         // heap's or a buffer's block is the device's, and the texture holds it.
+         let mut made = unsafe { make(core, &d, &shape, &plan, bind) };
+-        // Turnip's implicit linear layout can round a single layer up to
+-        // 4 KiB. The explicit layout can fit the same rows without that tail.
++        // Turnip can use the explicit row pitch and omit the tail padding
++        // of an implicit linear host image.
+         if matches!(
+             made,
+-            Err(Unmade::Unfit(OverCause::Pitch | OverCause::HostBindingSize))
++            Err(Unmade::Unfit(
++                OverCause::Pitch | OverCause::RenderReach | OverCause::HostBindingSize
++            ))
+         ) && core.exports.modifiers
+         {
+             if let (Some(Laid::DarwinHost { usage, .. }), Bind::InPlace { bytes_per_row, explicit_pitch, .. }) =

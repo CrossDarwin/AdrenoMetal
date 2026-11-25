@@ -1,0 +1,67 @@
+diff --git a/crates/metal2vulkan-runtime/src/counters.rs b/crates/metal2vulkan-runtime/src/counters.rs
+index 5b34080..c6f6799 100644
+--- a/crates/metal2vulkan-runtime/src/counters.rs
++++ b/crates/metal2vulkan-runtime/src/counters.rs
+@@ -668,7 +668,7 @@ struct Atomics {
+     over_copies_imported: AtomicU64,
+     over_copy_bytes_imported: AtomicU64,
+     host_texture_copy_bytes: [[AtomicU64; 3]; crate::HostTextureSource::ALL.len()],
+-    linear_texture_copy_causes: [AtomicU64; OVER_CAUSES],
++    host_texture_copy_causes: [[AtomicU64; OVER_CAUSES]; crate::HostTextureSource::ALL.len()],
+     /// Each [`OverCause`]'s over-copies, at its index: their count and bytes.
+     over_by_cause: [[AtomicU64; 2]; OVER_CAUSES],
+     attachment_read_copies: AtomicU64,
+@@ -1276,9 +1276,7 @@ impl Counters {
+         if into && read_only {
+             counts[2].fetch_add(bytes, Relaxed);
+         }
+-        if matches!(source, crate::HostTextureSource::Linear) {
+-            self.atomics.linear_texture_copy_causes[cause as usize].fetch_add(bytes, Relaxed);
+-        }
++        self.atomics.host_texture_copy_causes[source as usize][cause as usize].fetch_add(bytes, Relaxed);
+     }
+ 
+     /// Fallback upload, writeback and read-only upload bytes for a bridge entry point.
+@@ -1286,13 +1284,16 @@ impl Counters {
+         self.atomics.host_texture_copy_bytes[source as usize].each_ref().map(|bytes| bytes.load(Relaxed))
+     }
+ 
+-    /// Linear texture fallback bytes by layout and memory binding check.
+-    pub fn darwin_linear_texture_copy_causes(&self) -> [u64; 8] {
+-        let bytes = &self.atomics.linear_texture_copy_causes;
+-        [OverCause::HostMemory, OverCause::Pitch, OverCause::Alignment,
++    /// Fallback bytes by layout and binding check, with remaining causes in the last bucket.
++    pub fn darwin_host_texture_copy_causes(&self, source: crate::HostTextureSource) -> [u64; 9] {
++        let mut bytes = self.atomics.host_texture_copy_causes[source as usize]
++            .each_ref().map(|counter| counter.load(Relaxed));
++        let selected = [OverCause::HostMemory, OverCause::Pitch, OverCause::Alignment,
+             OverCause::RenderReach, OverCause::ImageMemory, OverCause::HostTextureBounds,
+             OverCause::HostBindingType, OverCause::HostBindingSize]
+-            .map(|cause| bytes[cause as usize].load(Relaxed))
++            .map(|cause| std::mem::take(&mut bytes[cause as usize]));
++        let [host, pitch, align, reach, memory, rows, kind, size] = selected;
++        [host, pitch, align, reach, memory, rows, kind, size, bytes.into_iter().sum()]
+     }
+ 
+     /// `copies` more copies of attachments' images into their shadows, of `bytes`
+diff --git a/crates/metal2vulkan-runtime/src/tests/over_causes.rs b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+index d1dd487..b8f30dc 100644
+--- a/crates/metal2vulkan-runtime/src/tests/over_causes.rs
++++ b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+@@ -105,7 +105,15 @@ fn darwin_host_binding_rejections_keep_the_image_memory_total() {
+     }
+     let metrics = counters.metrics();
+     assert_eq!((metrics.over_copies_image_memory, metrics.over_copy_bytes_image_memory), (3, 448));
+-    assert_eq!(counters.darwin_linear_texture_copy_causes(), [0, 0, 0, 0, 0, 64, 128, 256]);
++    assert_eq!(
++        counters.darwin_host_texture_copy_causes(crate::HostTextureSource::Linear),
++        [0, 0, 0, 0, 0, 64, 128, 256, 0],
++    );
++    counters.copied_host_texture(crate::HostTextureSource::IOSurface, 512, false, false, OverCause::LinearFeatures);
++    assert_eq!(
++        counters.darwin_host_texture_copy_causes(crate::HostTextureSource::IOSurface),
++        [0, 0, 0, 0, 0, 0, 0, 0, 512],
++    );
+ }
+ 
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]

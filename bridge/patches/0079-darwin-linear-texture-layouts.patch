@@ -1,0 +1,380 @@
+diff --git a/crates/metal2vulkan-runtime/src/blit.rs b/crates/metal2vulkan-runtime/src/blit.rs
+index f051c99..dd10288 100644
+--- a/crates/metal2vulkan-runtime/src/blit.rs
++++ b/crates/metal2vulkan-runtime/src/blit.rs
+@@ -207,6 +207,7 @@ impl BlitCommandEncoder {
+                 destination: destination.descriptor().pixel_format,
+             }));
+         }
++        destination.check_host_texture_write()?;
+         let same = source.id() == destination.id();
+         let sides = (Side::of(source), Side::of(destination));
+         let Some(copy) = texture_copy(&sides.0, from, size, &sides.1, to, same)? else {
+@@ -533,6 +534,9 @@ impl BlitCommandEncoder {
+         into_image: bool,
+     ) -> Result<(), Error> {
+         let (core, building) = self.parts();
++        if into_image {
++            texture.check_host_texture_write()?;
++        }
+         let vk_buffer = buffer.device_range().0;
+         building.keep_texture(texture);
+         building.keep(buffer);
+diff --git a/crates/metal2vulkan-runtime/src/counters.rs b/crates/metal2vulkan-runtime/src/counters.rs
+index e451e8c..b56de42 100644
+--- a/crates/metal2vulkan-runtime/src/counters.rs
++++ b/crates/metal2vulkan-runtime/src/counters.rs
+@@ -661,7 +661,8 @@ struct Atomics {
+     over_copy_bytes: AtomicU64,
+     over_copies_imported: AtomicU64,
+     over_copy_bytes_imported: AtomicU64,
+-    host_texture_copy_bytes: [[AtomicU64; 2]; crate::HostTextureSource::ALL.len()],
++    host_texture_copy_bytes: [[AtomicU64; 3]; crate::HostTextureSource::ALL.len()],
++    linear_texture_copy_causes: [AtomicU64; OVER_CAUSES],
+     /// Each [`OverCause`]'s over-copies, at its index: their count and bytes.
+     over_by_cause: [[AtomicU64; 2]; OVER_CAUSES],
+     attachment_read_copies: AtomicU64,
+@@ -1257,16 +1258,33 @@ impl Counters {
+         copy_bytes.fetch_add(bytes, Relaxed);
+     }
+ 
+-    pub(crate) fn copied_host_texture(&self, source: crate::HostTextureSource, bytes: u64, into: bool) {
+-        self.atomics.host_texture_copy_bytes[source as usize][usize::from(!into)]
+-            .fetch_add(bytes, Relaxed);
++    pub(crate) fn copied_host_texture(
++        &self, source: crate::HostTextureSource, bytes: u64, into: bool, read_only: bool, cause: OverCause,
++    ) {
++        let counts = &self.atomics.host_texture_copy_bytes[source as usize];
++        counts[usize::from(!into)].fetch_add(bytes, Relaxed);
++        if into && read_only {
++            counts[2].fetch_add(bytes, Relaxed);
++        }
++        if matches!(source, crate::HostTextureSource::Linear) {
++            self.atomics.linear_texture_copy_causes[cause as usize].fetch_add(bytes, Relaxed);
++        }
+     }
+ 
+-    /// Cumulative fallback upload and writeback bytes for the given bridge entry point.
+-    pub fn darwin_host_texture_copy_bytes(&self, source: crate::HostTextureSource) -> [u64; 2] {
++    /// Fallback upload, writeback and read-only upload bytes for a bridge entry point.
++    pub fn darwin_host_texture_copy_bytes(&self, source: crate::HostTextureSource) -> [u64; 3] {
+         self.atomics.host_texture_copy_bytes[source as usize].each_ref().map(|bytes| bytes.load(Relaxed))
+     }
+ 
++    /// Linear texture fallback bytes due to host backing, pitch, and binding alignment,
++    /// extent or allocation bounds, respectively.
++    pub fn darwin_linear_texture_copy_causes(&self) -> [u64; 5] {
++        let bytes = &self.atomics.linear_texture_copy_causes;
++        [OverCause::HostMemory, OverCause::Pitch, OverCause::Alignment,
++            OverCause::RenderReach, OverCause::ImageMemory]
++            .map(|cause| bytes[cause as usize].load(Relaxed))
++    }
++
+     /// `copies` more copies of attachments' images into their shadows, of `bytes`
+     /// ([`Metrics::attachment_read_copies`], [`Metrics::attachment_read_copy_bytes`]), which
+     /// count in [`Metrics::bytes_copied`] too.
+diff --git a/crates/metal2vulkan-runtime/src/over.rs b/crates/metal2vulkan-runtime/src/over.rs
+index d273102..a091022 100644
+--- a/crates/metal2vulkan-runtime/src/over.rs
++++ b/crates/metal2vulkan-runtime/src/over.rs
+@@ -500,7 +500,7 @@ pub(crate) unsafe fn record_side(
+             }
+             counters.over_copied(copy.bytes, copy.imported, copy.cause);
+             if let Some(source) = copy.host_texture {
+-                counters.copied_host_texture(source, copy.bytes, into);
++                counters.copied_host_texture(source, copy.bytes, into, copy.host_read_only, copy.cause);
+             }
+         }
+         device.cmd_pipeline_barrier2(
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 550ea4f..0dcd9e9 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -343,6 +343,7 @@ struct Named {
+     places: Vec<BytesPlace>,
+     form: Form,
+     host_texture: Option<HostTextureSource>,
++    host_read_only: bool,
+ }
+ 
+ /// How a texture's image holds its named bytes.
+@@ -1416,6 +1417,7 @@ impl Device {
+                     places: places.to_vec(),
+                     form: Form::Managed,
+                     host_texture: None,
++                    host_read_only: false,
+                 };
+                 (Some(named), vk::ImageLayout::UNDEFINED, plan.home)
+             }
+@@ -1431,6 +1433,7 @@ impl Device {
+                         bytes_per_image: 0,
+                     }],
+                     host_texture: surface.map(|surface| surface.source),
++                    host_read_only: surface.is_some_and(|surface| !surface.writable),
+                     form: match checked {
+                         Ok(_) => Form::InPlace,
+                         Err(cause) => Form::Copied(cause),
+@@ -1445,7 +1448,7 @@ impl Device {
+         let placed = matches!(source, Source::Plain | Source::Managed(..));
+         // Over a dma-buf's import in place, the import's buffer and the image's offset in it.
+         let mut acquired = None;
+-        let (bind, mut block) = match source {
++        let (mut bind, mut block) = match source {
+             Source::Plain | Source::Managed(..) => (Bind::Pooled, None),
+             Source::Heap(block, heap, offset) => {
+                 let bind = Bind::Heap {
+@@ -1509,6 +1512,7 @@ impl Device {
+                         _ => memory.len,
+                     },
+                     at: at + offset,
++                    explicit_pitch: false,
+                     bytes_per_row,
+                     reach,
+                 };
+@@ -1521,6 +1525,23 @@ impl Device {
+         // SAFETY: the device is live, and `plan` was checked against its image format query; a
+         // heap's or a buffer's block is the device's, and the texture holds it.
+         let mut made = unsafe { make(core, &d, &shape, &plan, bind) };
++        if matches!(made, Err(Unmade::Unfit(OverCause::Pitch))) && core.exports.modifiers {
++            if let (Some(Laid::DarwinHost { usage, .. }), Bind::InPlace { bytes_per_row, explicit_pitch, .. }) =
++                (laid, &mut bind)
++            {
++                // Turnip's explicit linear layout takes a 64-byte aligned u32 pitch.
++                if bytes_per_row.is_multiple_of(64)
++                    && u32::try_from(*bytes_per_row).is_ok()
++                    && linear_extent(core, &shape, &plan, usage, laid.and_then(Laid::handle), true)
++                        .is_some_and(|max| d.width <= max.width && d.height <= max.height)
++                {
++                    *explicit_pitch = true;
++                    // SAFETY: same import and bounds, with an explicit modifier layout
++                    // that the device's external image query supports.
++                    made = unsafe { make(core, &d, &shape, &plan, bind) };
++                }
++            }
++        }
+         // Where the device's linear image does not take the texture's layout, an image of its own
+         // that the submissions copy the bytes into and back.
+         if let (Err(Unmade::Unfit(cause)), Some(named)) = (&made, &mut named) {
+@@ -1919,8 +1940,19 @@ fn check_over(
+                 handle: ImportHandle::HostMemory,
+                 memory_type,
+             }),
+-        ) if surface.is_some_and(|surface| surface.writable) => {
+-            let surface = surface.unwrap();
++        ) if let Some(surface) = surface
++            && (surface.writable
++                || (matches!(surface.source, HostTextureSource::Linear)
++                    && plan.read
++                    && !plan.usage.intersects(
++                        vk::ImageUsageFlags::STORAGE
++                            | vk::ImageUsageFlags::COLOR_ATTACHMENT
++                            | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
++                    )
++                    && !d.usage.intersects(
++                        TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC | TextureUsage::RENDER_TARGET,
++                    ))) =>
++        {
+             // Use the supplied extent within the page import.
+             if offset.checked_add(surface.len).is_none_or(|end| end > buffer.length())
+                 || u64::from(d.height)
+@@ -1930,6 +1962,9 @@ fn check_over(
+                 return Ok(Err(OverCause::ImageMemory));
+             }
+             let mut usage = plan.linear_usage();
++            if !surface.writable {
++                usage &= !vk::ImageUsageFlags::TRANSFER_DST;
++            }
+             if plan.attachment_reads {
+                 let feedback_usage = usage
+                     | vk::ImageUsageFlags::SAMPLED
+@@ -1941,6 +1976,7 @@ fn check_over(
+                         plan,
+                         feedback_usage,
+                         Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT),
++                        false,
+                     )
+                     .is_some_and(|max| d.width <= max.width && d.height <= max.height);
+                 if feedback {
+@@ -1966,7 +2002,7 @@ fn check_over(
+         Laid::DarwinHost { usage, .. } => usage,
+         _ => plan.linear_usage(),
+     };
+-    let extent = linear_extent(core, shape, plan, usage, laid.handle())
++    let extent = linear_extent(core, shape, plan, usage, laid.handle(), false)
+         .is_some_and(|max| d.width <= max.width && d.height <= max.height);
+     let (linear, optimal) = core.format_features(plan.format);
+     let features = linear.contains(optimal & kept_features(plan.usage));
+@@ -2085,14 +2121,25 @@ fn linear_extent(
+     plan: &Plan,
+     usage: vk::ImageUsageFlags,
+     handle: Option<vk::ExternalMemoryHandleTypeFlags>,
++    explicit_pitch: bool,
+ ) -> Option<vk::Extent3D> {
+     let mut list = plan.format_list();
++    let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
++        .drm_format_modifier(0) // DRM_FORMAT_MOD_LINEAR
++        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+     let mut linear = vk::PhysicalDeviceImageFormatInfo2::default()
+         .format(plan.format)
+         .ty(shape.image_type)
+-        .tiling(vk::ImageTiling::LINEAR)
++        .tiling(if explicit_pitch {
++            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
++        } else {
++            vk::ImageTiling::LINEAR
++        })
+         .usage(usage)
+         .flags(plan.flags(shape));
++    if explicit_pitch {
++        linear = linear.push_next(&mut modifier);
++    }
+     if !plan.view_formats.is_empty() {
+         linear = linear.push_next(&mut list);
+     }
+@@ -2161,7 +2208,7 @@ fn linear_layout(
+     shape: &Shape,
+     plan: &Plan,
+ ) -> Option<(u64, u64, u64)> {
+-    let max = linear_extent(core, shape, plan, plan.linear_usage(), None)?;
++    let max = linear_extent(core, shape, plan, plan.linear_usage(), None, false)?;
+     if d.width > max.width || d.height > max.height {
+         return None;
+     }
+@@ -2860,6 +2907,7 @@ struct DarwinHostTexture {
+ }
+ 
+ /// Where [`make`] binds the image.
++#[derive(Clone, Copy)]
+ enum Bind {
+     /// A place in a texture block, or memory of its own.
+     Pooled,
+@@ -2876,6 +2924,7 @@ enum Bind {
+         usage: vk::ImageUsageFlags,
+         block_len: u64,
+         at: u64,
++        explicit_pitch: bool,
+         bytes_per_row: u64,
+         reach: Option<u64>,
+     },
+@@ -2970,7 +3019,18 @@ impl Made {
+         let mut list = plan.format_list();
+         let info = image_info(d, shape, plan, &mut list);
+         let mut external = vk::ExternalMemoryImageCreateInfo::default();
+-        let info = match bind {
++        let explicit_pitch = matches!(bind, Bind::InPlace { explicit_pitch: true, .. });
++        let layouts = [vk::SubresourceLayout {
++            row_pitch: match bind {
++                Bind::InPlace { bytes_per_row, .. } => bytes_per_row,
++                _ => 0,
++            },
++            ..Default::default()
++        }];
++        let mut modifier = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
++            .drm_format_modifier(0) // DRM_FORMAT_MOD_LINEAR
++            .plane_layouts(&layouts);
++        let mut info = match bind {
+             Bind::InPlace { handle, usage, .. } => {
+                 let info = info.tiling(vk::ImageTiling::LINEAR).usage(usage);
+                 match handle {
+@@ -2986,10 +3046,19 @@ impl Made {
+             }
+             Bind::Pooled | Bind::Heap { .. } => info,
+         };
++        if explicit_pitch {
++            info = info.tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT).push_next(&mut modifier);
++        }
+         let started = crate::host_time();
+         // SAFETY: the caller's contract: the device makes such an image.
+-        let image =
+-            unsafe { device.create_image(&info, None) }.map_err(Error::vulkan("vkCreateImage"))?;
++        let image = match unsafe { device.create_image(&info, None) } {
++            Ok(image) => image,
++            Err(vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
++                | vk::Result::ERROR_FORMAT_NOT_SUPPORTED) if explicit_pitch => {
++                return Err(Unmade::Unfit(OverCause::Pitch));
++            }
++            Err(error) => return Err(Error::vulkan("vkCreateImage")(error).into()),
++        };
+         let created = crate::host_time() - started;
+         self.image = Some(image);
+         let mut dedicated = vk::MemoryDedicatedRequirements::default();
+@@ -3022,12 +3091,17 @@ impl Made {
+             usage: _,
+             block_len,
+             at,
++            explicit_pitch,
+             bytes_per_row,
+             reach,
+         } = bind
+         {
+             let color = vk::ImageSubresource {
+-                aspect_mask: vk::ImageAspectFlags::COLOR,
++                aspect_mask: if explicit_pitch {
++                    vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
++                } else {
++                    vk::ImageAspectFlags::COLOR
++                },
+                 mip_level: 0,
+                 array_layer: 0,
+             };
+@@ -4024,6 +4098,7 @@ impl Texture {
+                 places: levels.clone().flat_map(level_places).collect(),
+                 form: named.form,
+                 host_texture: named.host_texture,
++                host_read_only: named.host_read_only,
+             }
+         });
+         let view = TextureInner {
+@@ -4166,6 +4241,7 @@ impl Texture {
+         bytes_per_image: u64,
+     ) -> Result<(), Error> {
+         crate::command::not_in_scheduled_handler()?;
++        self.check_host_texture_write()?;
+         let inner = &self.inner;
+         let len = bytes.len() as u64;
+         let Some(copy) = inner.copy(region, level, slice, len, bytes_per_row, bytes_per_image)?
+@@ -4444,6 +4520,20 @@ pub(crate) trait TextureObject {
+         matches!(self.object().body, Body::Texels(_))
+     }
+ 
++    /// A read-only import cannot be the destination of an explicit write.
++    fn check_host_texture_write(&self) -> Result<(), Error> {
++        let inner = self.object();
++        if inner.named.as_ref().is_some_and(|named| {
++            named.host_read_only && named.form == Form::InPlace
++        }) {
++            return Err(Error::Unsupported(Gap::SurfaceUsage {
++                pixel_format: inner.descriptor.pixel_format,
++                missing: vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
++            }));
++        }
++        Ok(())
++    }
++
+     /// Whether it reaches `level` and one of the `layers` layers from `layer` of its image: a view
+     /// reaches its own levels and slices alone.
+     fn reaches(&self, level: u32, layer: u32, layers: u32) -> bool {
+@@ -5026,6 +5116,7 @@ pub(crate) trait TextureObject {
+             bytes: u64::from(d.width) * u64::from(d.height) * u64::from(unit.bytes),
+             shared: named.buffer.is_shared(),
+             host_texture: named.host_texture,
++            host_read_only: named.host_read_only,
+             imported: device_copy.is_none() && block.memory.imported(),
+             cause,
+         };
+@@ -5496,6 +5587,7 @@ impl Device {
+             }],
+             form: Form::InPlace,
+             host_texture: None,
++            host_read_only: false,
+         };
+         let inner = TextureInner {
+             consumer: std::sync::Mutex::default(),
+@@ -5556,6 +5648,7 @@ pub(crate) struct OverCopy {
+     /// The bytes shaders reach are in an imported block (`Metrics::over_copies_imported`).
+     pub(crate) imported: bool,
+     pub(crate) host_texture: Option<HostTextureSource>,
++    pub(crate) host_read_only: bool,
+     /// Why the texture is not in place: the pair of [`Metrics`](crate::Metrics) its copies count
+     /// in too.
+     pub(crate) cause: OverCause,

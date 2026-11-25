@@ -1528,10 +1528,10 @@ static uint64_t flushSurfaces(NSMutableSet *surfaces) {
  }
  return flushed;
 }
-static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,NSUInteger surfaceLength) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
- NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
- if(!handle){NSString *error=lastError();logRenderBoxTexture(d,surface?"IOSurface":"buffer",error);
+ NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surfaceLength);
+ if(!handle){NSString *error=lastError();logRenderBoxTexture(d,surfaceLength?"IOSurface":"buffer",error);
   NBLOG(@"native-metal: texture over buffer refused: %@",error);return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
@@ -1590,7 +1590,7 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
  if(self.wrapped)noteUnalignedTexture(d,offset,row,__builtin_return_address(0));
- NBTexture *texture=textureOnBuffer(self,d,offset,row,false);
+ NBTexture *texture=textureOnBuffer(self,d,offset,row,0);
  if(gLogTextures && self.wrapped)logTexture("no-copy",d,nullptr,0,self.wrapped,offset,row,texture!=nil);
  return (id<MTLTexture>)texture;
 }
@@ -4992,7 +4992,7 @@ static void fillBaseLimits(id device);
  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
- NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+ NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,allocation-(start-(uintptr_t)base));
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
@@ -5839,6 +5839,23 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    uint64_t copies[2]={};
    if(nmb_device_host_texture_copies(gDevice,copies))
     row("RT2 host-texture copy %llu bytes %llu",(ull)copies[0],(ull)copies[1]);
+   uint64_t hostMetrics[45]={};
+   if(nmb_device_host_texture_metrics(gDevice,hostMetrics)) {
+    const char *sources[]={"IOSurface","buffer-texture","linear-texture"};
+    for(size_t i=0;i<3;i++) {
+     const uint64_t *m=hostMetrics+15*i;
+     row("RT2 %s in-place %llu fallback %llu upload %llu writeback %llu",
+         sources[i],(ull)m[0],(ull)m[1],(ull)m[2],(ull)m[3]);
+     if(m[4] || m[5])row("RT2 %s readonly %llu upload %llu",sources[i],(ull)m[4],(ull)m[5]);
+     if(m[2] || m[3]) {
+      row("RT2 %s copy host %llu pitch %llu align %llu reach %llu",
+          sources[i],(ull)m[6],(ull)m[7],(ull)m[8],(ull)m[9]);
+      row("RT2 %s bind rows %llu type %llu size %llu",
+          sources[i],(ull)m[11],(ull)m[12],(ull)m[13]);
+      if(m[10] || m[14])row("RT2 %s copy memory %llu other %llu",sources[i],(ull)m[10],(ull)m[14]);
+     }
+    }
+   }
    row("RT2 freed %llu allocate %llu ns %llu held-release %llu/%llu",(ull)m[18],(ull)m[19],(ull)m[20],(ull)m[30],(ull)m[31]);
    row("RT2 alloc-bytes texture %llu block %llu ring %llu stage %llu/%llu",(ull)m[21],(ull)m[22],(ull)m[23],(ull)m[24],(ull)m[25]);
    row("RT2 alloc-bytes take %llu/%llu first-use %llu ns %llu",(ull)m[26],(ull)m[27],(ull)m[28],(ull)m[29]);

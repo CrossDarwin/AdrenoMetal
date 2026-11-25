@@ -76,6 +76,7 @@ pub struct Buffer {
     // Claims keep placement IDs valid for views constructed after this call.
     _blocks: Arc<Vec<rt::Block>>,
     imported_pointer: Option<usize>,
+    imported_read_only: bool,
     lease: Option<Arc<crate::heap::Lease>>,
 }
 
@@ -87,6 +88,12 @@ impl Deref for Buffer {
 }
 
 impl Buffer {
+    #[cfg(target_os = "ios")]
+    pub(crate) fn host_import_writable(&self) -> Option<bool> {
+        (self.imported_pointer.is_some() && self.options.storage_mode() == StorageMode::Shared)
+            .then_some(!self.imported_read_only)
+    }
+
     pub(crate) fn placed(
         raw: rt::Buffer,
         device: rt::Device,
@@ -100,6 +107,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(Vec::new()),
             imported_pointer: None,
+            imported_read_only: false,
             lease: Some(lease),
         }
     }
@@ -164,6 +172,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: None,
+            imported_read_only: false,
             lease: None,
         };
         if let Some(bytes) = bytes {
@@ -334,6 +343,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: Some(pointer.as_ptr() as usize),
+            imported_read_only: read_only,
             lease: None,
         })
     }
