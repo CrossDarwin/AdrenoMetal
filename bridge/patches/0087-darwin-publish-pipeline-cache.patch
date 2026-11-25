@@ -1,0 +1,125 @@
+diff --git a/crates/metal2vulkan-runtime/src/cache.rs b/crates/metal2vulkan-runtime/src/cache.rs
+index f7c5b83..3d699dc 100644
+--- a/crates/metal2vulkan-runtime/src/cache.rs
++++ b/crates/metal2vulkan-runtime/src/cache.rs
+@@ -1761,6 +1761,58 @@ impl Caches {
+         store.writable().then_some(path.as_path())
+     }
+ 
++    /// Persist the worker's completed pipelines on the reaper.
++    pub(crate) fn publish(&self, device: &ash::Device, counters: &Counters) -> bool {
++        let Some(alone) = self.alone() else { return false };
++        let Some(path) = self.blob_to_write() else { return false };
++        let Some(current) = lock(&self.pipelines).current.clone() else { return false };
++        // SAFETY: the cache belongs to this device, and the exclusive guard bars creations.
++        let Ok(data) = (unsafe { device.get_pipeline_cache_data(current.0) }) else { return false };
++        drop(alone);
++        let size = data.len() as u64;
++        if size > self.bound.load(Relaxed) || write_whole(path, &[&frame(&data), &data]).is_err() {
++            return false;
++        }
++        counters.cache_written(24 + size);
++        lock(&self.pipelines).written = size;
++        true
++    }
++
++    /// Merge the compatible blob from the consumer's read-only layer.
++    pub(crate) fn merge_external(&self, device: &ash::Device) -> bool {
++        let Some(header) = self.header.get() else { return false };
++        let Some(lookup) = &self.lookup else { return false };
++        let name = blob_name(header);
++        let Some(file) = lookup.read(&name) else { return false };
++        let data = unframe(&file).filter(|data| {
++            data.starts_with(header) && data.len() as u64 <= self.bound.load(Relaxed)
++        });
++        let Some(data) = data else {
++            lookup.verdict(&name, false, file.len() as u64);
++            return false;
++        };
++        // SAFETY: the checked blob was made for this device's pipeline cache header.
++        let Some(source) = (unsafe { make_cache(device, data) }) else {
++            lookup.verdict(&name, false, file.len() as u64);
++            return false;
++        };
++        let made = self.alone().is_some_and(|_alone| {
++            let pipelines = lock(&self.pipelines);
++            !pipelines.seeding && pipelines.current.as_ref().is_some_and(|current| {
++                // SAFETY: both caches belong to this device and are not in use.
++                unsafe { device.merge_pipeline_caches(current.0, &[source]) }.is_ok()
++            })
++        });
++        // SAFETY: the merge is synchronous and no other thread receives source.
++        unsafe { device.destroy_pipeline_cache(source, None) };
++        if made {
++            lookup.verdict(&name, true, file.len() as u64);
++            self.created.store(host_time(), Relaxed);
++            self.grown.store(true, SeqCst);
++        }
++        made
++    }
++
+     /// Writes `data`, the cache's data the driver gave at size `size`, over the device's blob at
+     /// `path`, where it is within the bound.
+     fn write(&self, path: &Path, data: &[u8], size: u64, counters: &Counters) {
+diff --git a/crates/metal2vulkan-runtime/src/device.rs b/crates/metal2vulkan-runtime/src/device.rs
+index f10f83a..9911316 100644
+--- a/crates/metal2vulkan-runtime/src/device.rs
++++ b/crates/metal2vulkan-runtime/src/device.rs
+@@ -998,6 +998,23 @@ impl Device {
+         self.shared.core.counters.clone()
+     }
+ 
++    /// Write the current pipeline cache and queued lowerings to this device's cache directory.
++    pub fn publish_pipeline_cache(&self) -> bool {
++        let (send, receive) = std::sync::mpsc::sync_channel(1);
++        self.shared.core.reaper.give(crate::reaper::Job::PublishCache(send));
++        receive.recv_timeout(std::time::Duration::from_secs(15)).unwrap_or(false)
++    }
++
++    /// Merge a compatible pipeline cache made available by the device's cache reader.
++    pub fn merge_external_pipeline_cache(&self) -> bool {
++        let core = &self.shared.core;
++        let merged = core.caches.merge_external(&core.device);
++        if merged {
++            core.reaper.poke();
++        }
++        merged
++    }
++
+     /// What lost the device: the Vulkan call and result of its first loss, a call of the
+     /// runtime's or one the consumer reported ([`Device::report_loss`]), None while it is not
+     /// lost. Metal's counterpart is the code and description of `MTLCommandBuffer.error`
+diff --git a/crates/metal2vulkan-runtime/src/reaper.rs b/crates/metal2vulkan-runtime/src/reaper.rs
+index 8e2bba6..245b813 100644
+--- a/crates/metal2vulkan-runtime/src/reaper.rs
++++ b/crates/metal2vulkan-runtime/src/reaper.rs
+@@ -36,6 +36,7 @@ struct State {
+ 
+ pub(crate) enum Job {
+     Free(Free),
++    PublishCache(std::sync::mpsc::SyncSender<bool>),
+     /// A released texture's image, of its bytes, which an upload held past the texture: the
+     /// release is looked at under the work lock, which the texture's drop may run under
+     /// ([`Work::release`](crate::submit::Work::release)). Nothing where the image is gone.
+@@ -129,7 +130,7 @@ impl Reaper {
+         for job in jobs {
+             match job {
+                 Job::Free(object) => free(core, object),
+-                Job::Released(..) | Job::Teardown(_) => {}
++                Job::Released(..) | Job::Teardown(_) | Job::PublishCache(_) => {}
+             }
+         }
+     }
+@@ -311,6 +312,12 @@ pub(crate) fn run(core: Arc<Core>) {
+             }
+         };
+         match next {
++            Next::Job(Job::PublishCache(reply)) => {
++                while let Some((file, bytes)) = core.caches.next_write() {
++                    core.caches.write_kept(&file, &bytes, &core.counters);
++                }
++                let _ = reply.send(core.caches.publish(&core.device, &core.counters));
++            }
+             Next::Job(Job::Free(object)) => free(&core, object),
+             Next::Job(Job::Released(image, bytes)) => {
+                 if let Some(image) = image.upgrade() {

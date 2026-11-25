@@ -694,6 +694,16 @@ pub extern "C" fn nmb_device_release(device: *mut NmbDevice) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_publish_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || Ok(get(device)?.0.publish_pipeline_cache()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_merge_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || Ok(get(device)?.0.merge_external_pipeline_cache()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_name(device: *const NmbDevice, out: *mut c_char, size: usize) -> usize {
     guard(0, || {
         let raw = get(device)?.0.raw();
@@ -1965,8 +1975,8 @@ pub unsafe extern "C" fn nmb_compute_pipeline_new_with_options(device: *mut NmbD
         let descriptor = ComputePipelineDescriptor::new(StageSource::Function(get(function)?.0.function_descriptor()));
         let device = &get(device)?.0;
         resolved.check_compute(device, &descriptor)?;
-        let state = crate::pipelines::compute(device, &descriptor);
-        Ok(boxed(NmbComputePipeline(state.map_err(e("compute pipeline"))?)))
+        let state = crate::pipelines::compute(device, &descriptor)?;
+        Ok(boxed(NmbComputePipeline(state)))
     })
 }
 

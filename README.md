@@ -79,6 +79,18 @@ compilation and saves progress. The worker prevents automatic display and system
 sleep while compiling and releases its assertions on completion, stop or failure.
 `--status` prints its current state as JSON.
 
+On Uke iPadOS, the Shader Cache IPA starts an on-demand system worker. Stop and
+leaving the foreground stop compilation between pipeline calls. The worker
+publishes the cache and saves checkpoints at the batch limit or when memory
+growth reaches a threshold. The app starts a fresh worker to resume the run.
+
+Successful checkpoints use the library revision, runtime and Turnip build.
+Refusals and partially compiled libraries also use the primer recipe
+revision. BackBoard reads the published cache. The worker records its physical
+footprint, resident and compressed memory, malloc statistics, and missing
+inventory paths in `prime.log`. Per-function failures go to
+`prime-current-refusals.log`.
+
 ## Diagnostics
 
 DEBUG sampling requires `diag=1`, exposed to the process as `SHENG_DIAG=1`.
