@@ -359,6 +359,12 @@ impl Buffer {
     pub fn resource_options(&self) -> ResourceOptions {
         self.options
     }
+    pub(crate) fn writable_contents(&self) -> Option<NonNull<u8>> {
+        if self.imported_read_only {
+            return None;
+        }
+        self.contents()
+    }
     pub fn device(&self) -> &rt::Device {
         &self.device
     }

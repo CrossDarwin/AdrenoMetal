@@ -146,6 +146,10 @@ impl Deref for Texture {
     }
 }
 impl Texture {
+    pub(crate) fn device(&self) -> &rt::Device {
+        &self.device
+    }
+
     pub(crate) fn placed(
         raw: rt::Texture,
         descriptor: TextureDescriptor,
