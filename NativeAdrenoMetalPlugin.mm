@@ -160,6 +160,16 @@ static unsigned patchIOSurfaceRowAlignment(uintptr_t slide) {
         words[3] != 0xea14011f || words[4] != 0x540003a0) return 0x6E61;
     return patchQuartzCoreInstruction(start + sizeof(uint32_t) + slide, original, replacement, 0x6E60);
 }
+
+static unsigned patchRenderSurfaceRowAlignment(uintptr_t slide) {
+    // CA::Render::Surface checks each plane separately. Keep the original base
+    // alignment in x24 and use the Turnip row alignment in x23.
+    constexpr uintptr_t start = 0x184533744;
+    uint32_t words[4] = {};
+    if (!readTask(start + slide, words, sizeof words)) return 0x6E70;
+    if (words[0] != 0x90315748 || words[1] != 0x912fc108 || words[2] != 0xf9400118) return 0x6E71;
+    return patchQuartzCoreInstruction(start + 3 * sizeof(uint32_t) + slide, 0xf9400517, 0xd2800817, 0x6E70);
+}
 #endif
 // Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
@@ -280,6 +290,24 @@ static void *mergePublishedCache(void *) {
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
+#if !TARGET_OS_OSX && defined(__arm64e__)
+    const char *name = getprogname();
+    if ((!strcmp(name, "MobileSafari") || !strcmp(name, "com.apple.WebKit.GPU")) &&
+        bootArgSet("panel-sync=2")) {
+        // The render-server patch is process-local. Safari and its GPU extension
+        // also validate IOSurface rows in their own QuartzCore mappings.
+        unsigned status = 0x6E60, renderStatus = 0x6E70;
+        static void *const quartzCore = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY | RTLD_LOCAL);
+        void *start = quartzCore ? dlsym(quartzCore, "CARenderServerStart") : nullptr;
+        if (start) {
+            const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
+            status = patchIOSurfaceRowAlignment(slide);
+            renderStatus = patchRenderSurfaceRowAlignment(slide);
+        }
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal IOSurface alignment: image=%{public}d symbol=%{public}d viability=0x%{public}x render=0x%{public}x",
+               quartzCore != nullptr, start != nullptr, status, renderStatus);
+    }
+#endif
     uint64_t registryID = 0;
     if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
         if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -603,7 +631,9 @@ static id deviceForPort(unsigned port) {
                 if (status == 0x6E42 && bootArgSet("panel-sync=2")) {
                     const unsigned rowStatus = patchIOSurfaceRowAlignment(slide);
                     gpu->mark(rowStatus);
-                    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal IOSurface row alignment patch: status=0x%{public}x", rowStatus);
+                    const unsigned renderStatus = patchRenderSurfaceRowAlignment(slide);
+                    gpu->mark(renderStatus);
+                    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal IOSurface alignment: viability=0x%{public}x render=0x%{public}x", rowStatus, renderStatus);
                 }
             }
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no

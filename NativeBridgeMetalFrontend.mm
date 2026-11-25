@@ -653,6 +653,18 @@ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescripto
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0,
                    surface?IOSurfaceGetWidth(surface):0,surface?IOSurfaceGetHeight(surface):0,textureRotation(d),textureFlag(d,"framebufferOnly")};
+ static const bool webKitGPU = !strcmp(getprogname(), "com.apple.WebKit.GPU");
+ static std::atomic<unsigned> webKitRefusals[5];
+ if (webKitGPU && webKitRefusals[step-1].load(std::memory_order_relaxed)<4 &&
+     webKitRefusals[step-1].fetch_add(1,std::memory_order_relaxed)<4) {
+  const char *reason = step>=4 ? nmb_last_error() : "";
+  os_log_error(OS_LOG_DEFAULT,
+   "NativeAdrenoMetal WebKit IOSurface refusal step=%{public}u id=%{public}u format=%{public}x Metal=%{public}u plane=%{public}u/%{public}u offset=%{public}llu row=%{public}llu alloc=%{public}llu size=%{public}llux%{public}llu requested=%{public}llux%{public}llu reason=%{public}s",
+   step,surface?IOSurfaceGetID(surface):0,r.format,r.pixelFormat,r.plane,r.planes,
+   (unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,
+   (unsigned long long)r.surfaceWidth,(unsigned long long)r.surfaceHeight,
+   (unsigned long long)r.width,(unsigned long long)r.height,reason?reason:"");
+ }
  std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
 }
 static void noteFormat(uint32_t format,bool made) {
